@@ -375,6 +375,70 @@ mod tests {
     }
 
     #[test]
+    fn project_skin_fixtures_keep_static_summaries_tied_to_source() {
+        let classic = include_bytes!("../tests/skins/walkit-classic.wsz");
+        let classic_dir = scratch("fixture-classic");
+        let _ = std::fs::remove_dir_all(&classic_dir);
+        extract(classic, &classic_dir).unwrap();
+        let classic_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(classic_dir.join("semantics.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            classic_json["classic"]["missing_sheets"],
+            serde_json::json!([])
+        );
+        assert_eq!(classic_json["classic"]["playlist"]["font"], "Arial");
+        assert_eq!(
+            classic_json["classic"]["visualizer_colors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            24
+        );
+        assert_eq!(
+            classic_json["classic"]["region_geometry"],
+            serde_json::json!([])
+        );
+
+        let modern = include_bytes!("../tests/skins/walkit-modern.wal");
+        let modern_dir = scratch("fixture-modern");
+        let _ = std::fs::remove_dir_all(&modern_dir);
+        extract(modern, &modern_dir).unwrap();
+        let modern_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(modern_dir.join("semantics.json")).unwrap())
+                .unwrap();
+        let semantics = &modern_json["modern"];
+        assert_eq!(semantics["xml_documents"].as_array().unwrap().len(), 1);
+        assert_eq!(semantics["xml_documents"][0]["source_file"], "skin.xml");
+        assert_eq!(
+            semantics["xml_documents"][0]["includes"],
+            serde_json::json!([])
+        );
+        assert_eq!(semantics["layouts"].as_array().unwrap().len(), 2);
+        assert_eq!(semantics["duplicate_declarations"], serde_json::json!([]));
+        let refs = semantics["file_references"].as_array().unwrap();
+        assert_eq!(refs.len(), 20);
+        assert!(refs
+            .iter()
+            .all(|reference| reference["archive_file_present"] == true));
+        assert!(semantics["xml_documents"][0]["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|definition| {
+                definition["tag"] == "bitmap"
+                    && definition["attributes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|attribute| attribute["name"] == "id" && attribute["value"] == "close")
+            }));
+
+        let _ = std::fs::remove_dir_all(classic_dir);
+        let _ = std::fs::remove_dir_all(modern_dir);
+    }
+
+    #[test]
     fn recognizes_wal_and_rejects_existing_destination() {
         let bytes = archive(&[("skin.xml", b"<WasabiXML/>")]);
         assert_eq!(inventory(&bytes).unwrap().archive_kind, "wal");

@@ -4,6 +4,7 @@
 //! skin runtime or executes scripts.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::rc::Rc;
 use walkit::draw::Rgb;
 use walkit::files::{MemoryFiles, SkinFiles};
@@ -63,10 +64,41 @@ pub struct ModernSemantics {
     pub containers: Vec<ContainerMetadata>,
     /// Declared layouts and their static element trees, with source attributes kept as text.
     pub layouts: Vec<LayoutMetadata>,
+    /// Source documents and their directly written declarations; this is not an include graph.
+    pub xml_documents: Vec<XmlDocumentMetadata>,
+    pub duplicate_declarations: Vec<DuplicateDeclaration>,
+    pub file_references: Vec<XmlFileReference>,
     /// Compiled script files are listed as opaque dependencies; they are never run or decoded.
     pub scripts: Vec<String>,
     pub fonts: Vec<String>,
     pub plugins: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct XmlDocumentMetadata {
+    pub source_file: String,
+    /// Literal include paths as written in this file. Resolution and reachability are not inferred.
+    pub includes: Vec<String>,
+    /// Direct children of `<elements>` blocks, retaining IDs and attributes as parsed.
+    pub definitions: Vec<StaticElement>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DuplicateDeclaration {
+    pub tag: String,
+    pub id: String,
+    /// Source file for each occurrence, including repeated declarations within one file.
+    pub source_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct XmlFileReference {
+    pub source_file: String,
+    pub tag: String,
+    pub id: Option<String>,
+    pub path: String,
+    /// `None` means the runtime generates or substitutes this resource path.
+    pub archive_file_present: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,7 +237,8 @@ pub fn inspect<'a>(
                 (None, None)
             } else {
                 let info = walkit::info::modern(&files);
-                let layouts = layouts(&files, skin_folder.as_deref().unwrap_or_default());
+                let (layouts, xml_documents, duplicate_declarations, file_references) =
+                    inspect_xml_documents(&files, skin_folder.as_deref().unwrap_or_default());
                 let i = info.skin_info;
                 let skin_info = SkinMetadata {
                     name: i.name,
@@ -226,18 +259,19 @@ pub fn inspect<'a>(
                         default_visible: c.default_visible,
                     })
                     .collect();
-                (
-                    None,
-                    Some(ModernSemantics {
-                        skin_info,
-                        format_version: info.format_version,
-                        containers,
-                        layouts,
-                        scripts: info.scripts,
-                        fonts: info.fonts,
-                        plugins: info.plugins,
-                    }),
-                )
+                let modern = Some(ModernSemantics {
+                    skin_info,
+                    format_version: info.format_version,
+                    containers,
+                    layouts,
+                    xml_documents,
+                    duplicate_declarations,
+                    file_references,
+                    scripts: info.scripts,
+                    fonts: info.fonts,
+                    plugins: info.plugins,
+                });
+                (None, modern)
             }
         }
         _ => (None, None),
@@ -318,8 +352,19 @@ fn find_after(bytes: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
         .map(|offset| start + offset + needle.len())
 }
 
-fn layouts(files: &MemoryFiles, folder: &str) -> Vec<LayoutMetadata> {
+fn inspect_xml_documents(
+    files: &MemoryFiles,
+    folder: &str,
+) -> (
+    Vec<LayoutMetadata>,
+    Vec<XmlDocumentMetadata>,
+    Vec<DuplicateDeclaration>,
+    Vec<XmlFileReference>,
+) {
     let mut layouts = Vec::new();
+    let mut documents = Vec::new();
+    let mut declarations: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut file_references = Vec::new();
     for path in files.names() {
         if !path.to_ascii_lowercase().ends_with(".xml") {
             continue;
@@ -328,49 +373,129 @@ fn layouts(files: &MemoryFiles, folder: &str) -> Vec<LayoutMetadata> {
             continue;
         };
         let text = String::from_utf8_lossy(&bytes);
-        for root in walkit::xml::parse(&text) {
-            collect_layouts(&root, &format!("{folder}{path}"), None, &mut layouts);
+        let source_file = format!("{folder}{path}");
+        let mut includes = Vec::new();
+        let mut definitions = Vec::new();
+        {
+            let mut scan = XmlScan {
+                files,
+                layouts: &mut layouts,
+                includes: &mut includes,
+                definitions: &mut definitions,
+                declarations: &mut declarations,
+                file_references: &mut file_references,
+            };
+            for root in walkit::xml::parse(&text) {
+                scan.node(&root, &source_file, None);
+            }
         }
+        documents.push(XmlDocumentMetadata {
+            source_file,
+            includes,
+            definitions,
+        });
     }
-    layouts
+    let mut duplicate_declarations: Vec<_> = declarations
+        .into_iter()
+        .filter(|(_, source_files)| source_files.len() > 1)
+        .map(|((tag, id), mut source_files)| {
+            source_files.sort();
+            DuplicateDeclaration {
+                tag,
+                id,
+                source_files,
+            }
+        })
+        .collect();
+    duplicate_declarations.sort_by(|a, b| (&a.tag, &a.id).cmp(&(&b.tag, &b.id)));
+    (layouts, documents, duplicate_declarations, file_references)
 }
 
-fn collect_layouts(
-    node: &walkit::xml::XmlNode,
-    source_file: &str,
-    parent_container: Option<&str>,
-    out: &mut Vec<LayoutMetadata>,
-) {
-    let container = if node.name == "container" {
-        node.get("id").or(parent_container)
-    } else {
-        parent_container
-    };
-    if node.name == "layout" {
-        out.push(LayoutMetadata {
-            source_file: source_file.to_string(),
-            container_id: container.map(str::to_string),
-            id: node.get("id").map(str::to_string),
-            width: node.get("w").map(str::to_string),
-            height: node.get("h").map(str::to_string),
-            attributes: node
-                .attrs
-                .iter()
-                .map(|(name, value)| StaticAttribute {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-            elements: node
-                .children
-                .iter()
-                .map(|child| static_element(child.as_ref()))
-                .collect(),
-        });
-        return;
-    }
-    for child in &node.children {
-        collect_layouts(child, source_file, container, out);
+struct XmlScan<'a> {
+    files: &'a MemoryFiles,
+    layouts: &'a mut Vec<LayoutMetadata>,
+    includes: &'a mut Vec<String>,
+    definitions: &'a mut Vec<StaticElement>,
+    declarations: &'a mut HashMap<(String, String), Vec<String>>,
+    file_references: &'a mut Vec<XmlFileReference>,
+}
+
+impl XmlScan<'_> {
+    fn node(
+        &mut self,
+        node: &walkit::xml::XmlNode,
+        source_file: &str,
+        parent_container: Option<&str>,
+    ) {
+        let container = if node.name == "container" {
+            node.get("id").or(parent_container)
+        } else {
+            parent_container
+        };
+        if node.name == "include" {
+            if let Some(path) = node.get("file") {
+                self.includes.push(path.to_string());
+            }
+        }
+        if node.name == "elements" {
+            self.definitions.extend(
+                node.children
+                    .iter()
+                    .map(|child| static_element(child.as_ref())),
+            );
+        }
+        if let Some(id) = node.get("id") {
+            if matches!(
+                node.name.as_str(),
+                "bitmap" | "bitmapfont" | "color" | "container" | "truetypefont"
+            ) {
+                self.declarations
+                    .entry((node.name.clone(), id.to_ascii_lowercase()))
+                    .or_default()
+                    .push(source_file.to_string());
+            }
+        }
+        if matches!(node.name.as_str(), "bitmap" | "truetypefont" | "script") {
+            if let Some(path) = node.get("file") {
+                let runtime_generated = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("$solid"));
+                self.file_references.push(XmlFileReference {
+                    source_file: source_file.to_string(),
+                    tag: node.name.clone(),
+                    id: node.get("id").map(str::to_string),
+                    path: path.to_string(),
+                    archive_file_present: (!runtime_generated).then(|| self.files.exists(path)),
+                });
+            }
+        }
+        if node.name == "layout" {
+            self.layouts.push(LayoutMetadata {
+                source_file: source_file.to_string(),
+                container_id: container.map(str::to_string),
+                id: node.get("id").map(str::to_string),
+                width: node.get("w").map(str::to_string),
+                height: node.get("h").map(str::to_string),
+                attributes: node
+                    .attrs
+                    .iter()
+                    .map(|(name, value)| StaticAttribute {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                elements: node
+                    .children
+                    .iter()
+                    .map(|child| static_element(child.as_ref()))
+                    .collect(),
+            });
+            return;
+        }
+        for child in &node.children {
+            self.node(child, source_file, container);
+        }
     }
 }
 
@@ -469,6 +594,46 @@ mod tests {
             modern.layouts[0].elements[0].children[0].attributes[0].value,
             "main.bmp"
         );
+    }
+
+    #[test]
+    fn source_documents_expose_raw_includes_definitions_and_file_presence() {
+        let entries = [
+            (
+                "skin.xml",
+                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><elements><bitmap id="Logo" file="img/logo.png"/></elements></WasabiXML>"#[..]),
+            ),
+            (
+                "parts/ui.xml",
+                Rc::from(&br#"<elements><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><script id="loader" file="scripts/loader.maki"/></elements>"#[..]),
+            ),
+            ("img/logo.png", Rc::from(&b"logo"[..])),
+            ("img/alternate.png", Rc::from(&b"alternate"[..])),
+            ("scripts/loader.maki", Rc::from(&b"opaque script"[..])),
+        ];
+        let semantics = inspect("wal", entries);
+        let modern = semantics.modern.unwrap();
+        assert_eq!(modern.xml_documents.len(), 2);
+        assert_eq!(modern.xml_documents[0].source_file, "parts/ui.xml");
+        assert_eq!(modern.xml_documents[1].includes, ["parts/ui.xml"]);
+        assert_eq!(modern.xml_documents[1].definitions[0].tag, "bitmap");
+        assert_eq!(modern.duplicate_declarations.len(), 1);
+        assert_eq!(modern.duplicate_declarations[0].tag, "bitmap");
+        assert_eq!(modern.duplicate_declarations[0].id, "logo");
+        assert_eq!(modern.duplicate_declarations[0].source_files.len(), 2);
+        let present = |path: &str| {
+            modern
+                .file_references
+                .iter()
+                .find(|reference| reference.path == path)
+                .unwrap()
+                .archive_file_present
+        };
+        assert_eq!(present("img/logo.png"), Some(true));
+        assert_eq!(present("img/alternate.png"), Some(true));
+        assert_eq!(present("img/missing.png"), Some(false));
+        assert_eq!(present("$solid"), None);
+        assert_eq!(present("scripts/loader.maki"), Some(true));
     }
 
     #[test]
