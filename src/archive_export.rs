@@ -414,6 +414,7 @@ mod tests {
             semantics["xml_documents"][0]["includes"],
             serde_json::json!([])
         );
+        assert_eq!(semantics["xml_include_references"], serde_json::json!([]));
         assert_eq!(semantics["layouts"].as_array().unwrap().len(), 2);
         assert_eq!(semantics["duplicate_declarations"], serde_json::json!([]));
         let refs = semantics["file_references"].as_array().unwrap();

@@ -76,9 +76,11 @@ prototype is retained.
 available sheets, playlist colors/font, visualizer colors, region names and polygon coordinates,
 and cursors. For modern skins it summarizes author metadata, declared containers and layouts,
 element attributes, and source XML documents. Each document records literal include paths and
-direct `<elements>` definitions; resource references record whether the literal archive path
-exists, and repeated IDs are reported as duplicate declarations. These are source declarations,
-not a resolved include graph: the summary does not identify loaded documents, reachable
+direct `<elements>` definitions; include references record whether their literal target exists
+at the skin root. Resource references record whether the literal archive path exists, and
+repeated IDs are reported as duplicate declarations. These are source declarations, not a
+resolved include graph: a missing root entry may still resolve relative to its including file,
+and the summary does not identify loaded documents, reachable
 definitions, or active layouts. Recognized bitmap attributes in the source are reported with
 case-insensitive lexical matches to bitmap declaration IDs and literal archive-path presence.
 This does not resolve aliases, include order, old-style bitmap names, base-skin resources, or

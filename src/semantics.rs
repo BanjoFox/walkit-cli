@@ -66,6 +66,8 @@ pub struct ModernSemantics {
     pub layouts: Vec<LayoutMetadata>,
     /// Source documents and their directly written declarations; this is not an include graph.
     pub xml_documents: Vec<XmlDocumentMetadata>,
+    /// Include declarations and whether their literal target exists at the skin root.
+    pub xml_include_references: Vec<XmlIncludeReference>,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     pub file_references: Vec<XmlFileReference>,
     /// Literal layout attributes used by walkit's runtime as bitmap names; matching is lexical.
@@ -83,6 +85,14 @@ pub struct XmlDocumentMetadata {
     pub includes: Vec<String>,
     /// Direct children of `<elements>` blocks, retaining IDs and attributes as parsed.
     pub definitions: Vec<StaticElement>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct XmlIncludeReference {
+    pub source_file: String,
+    pub target: String,
+    /// Root-relative lookup only; false does not imply a runtime include failure.
+    pub root_entry_present: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +289,7 @@ pub fn inspect<'a>(
                     containers,
                     layouts: xml.layouts,
                     xml_documents: xml.documents,
+                    xml_include_references: xml.include_references,
                     duplicate_declarations: xml.duplicate_declarations,
                     file_references: xml.file_references,
                     bitmap_references: xml.bitmap_references,
@@ -370,6 +381,7 @@ fn find_after(bytes: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
 struct XmlInspection {
     layouts: Vec<LayoutMetadata>,
     documents: Vec<XmlDocumentMetadata>,
+    include_references: Vec<XmlIncludeReference>,
     duplicate_declarations: Vec<DuplicateDeclaration>,
     file_references: Vec<XmlFileReference>,
     bitmap_references: Vec<BitmapReference>,
@@ -381,6 +393,7 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
     let mut declarations: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut file_references = Vec::new();
     let mut raw_bitmap_references = Vec::new();
+    let mut include_references = Vec::new();
     for path in files.names() {
         if !path.to_ascii_lowercase().ends_with(".xml") {
             continue;
@@ -401,6 +414,7 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
                 declarations: &mut declarations,
                 file_references: &mut file_references,
                 bitmap_references: &mut raw_bitmap_references,
+                include_references: &mut include_references,
             };
             for root in walkit::xml::parse(&text) {
                 scan.node(&root, &source_file, None);
@@ -412,6 +426,14 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
             definitions,
         });
     }
+    let include_references = include_references
+        .into_iter()
+        .map(|(source_file, target)| XmlIncludeReference {
+            source_file,
+            root_entry_present: files.exists(&target),
+            target,
+        })
+        .collect();
     let bitmap_declaration_files: HashMap<_, _> = declarations
         .iter()
         .filter(|((tag, _), _)| tag == "bitmap")
@@ -453,6 +475,7 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
     XmlInspection {
         layouts,
         documents,
+        include_references,
         duplicate_declarations,
         file_references,
         bitmap_references,
@@ -460,6 +483,7 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
 }
 
 type RawBitmapReference = (String, String, Option<String>, String, String);
+type RawXmlIncludeReference = (String, String);
 
 struct XmlScan<'a> {
     files: &'a MemoryFiles,
@@ -469,6 +493,7 @@ struct XmlScan<'a> {
     declarations: &'a mut HashMap<(String, String), Vec<String>>,
     file_references: &'a mut Vec<XmlFileReference>,
     bitmap_references: &'a mut Vec<RawBitmapReference>,
+    include_references: &'a mut Vec<RawXmlIncludeReference>,
 }
 
 impl XmlScan<'_> {
@@ -486,6 +511,8 @@ impl XmlScan<'_> {
         if node.name == "include" {
             if let Some(path) = node.get("file") {
                 self.includes.push(path.to_string());
+                self.include_references
+                    .push((source_file.to_string(), path.to_string()));
             }
         }
         if node.name == "elements" {
@@ -676,7 +703,7 @@ mod tests {
         let entries = [
             (
                 "skin.xml",
-                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><elements><bitmap id="Logo" file="img/logo.png"/></elements><container id="main"><layout id="normal"><button id="close" image="logo"/><button id="bad" image="not-declared"/></layout></container></WasabiXML>"#[..]),
+                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><include file="missing.xml"/><elements><bitmap id="Logo" file="img/logo.png"/></elements><container id="main"><layout id="normal"><button id="close" image="logo"/><button id="bad" image="not-declared"/></layout></container></WasabiXML>"#[..]),
             ),
             (
                 "parts/ui.xml",
@@ -690,7 +717,10 @@ mod tests {
         let modern = semantics.modern.unwrap();
         assert_eq!(modern.xml_documents.len(), 2);
         assert_eq!(modern.xml_documents[0].source_file, "parts/ui.xml");
-        assert_eq!(modern.xml_documents[1].includes, ["parts/ui.xml"]);
+        assert_eq!(
+            modern.xml_documents[1].includes,
+            ["parts/ui.xml", "missing.xml"]
+        );
         assert_eq!(modern.xml_documents[1].definitions[0].tag, "bitmap");
         assert_eq!(modern.duplicate_declarations.len(), 1);
         assert_eq!(modern.duplicate_declarations[0].tag, "bitmap");
@@ -709,6 +739,9 @@ mod tests {
         assert_eq!(present("img/missing.png"), Some(false));
         assert_eq!(present("$solid"), None);
         assert_eq!(present("scripts/loader.maki"), Some(true));
+        assert_eq!(modern.xml_include_references.len(), 2);
+        assert!(modern.xml_include_references[0].root_entry_present);
+        assert!(!modern.xml_include_references[1].root_entry_present);
         let bitmap_ref = |target: &str| {
             modern
                 .bitmap_references
