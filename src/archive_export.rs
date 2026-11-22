@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::rc::Rc;
 
 use serde::Serialize;
 
@@ -35,7 +36,7 @@ pub struct Entry {
     pub resource: &'static str,
     pub extracted: bool,
     #[serde(skip)]
-    bytes: Vec<u8>,
+    bytes: Rc<[u8]>,
 }
 
 /// Reads and bounds a local archive before allocating its contents.
@@ -97,11 +98,10 @@ pub fn inventory(bytes: &[u8]) -> Result<Manifest, String> {
             .unix_mode()
             .is_some_and(|mode| mode & 0o170000 == 0o120000);
         let output_path = if is_symlink { None } else { normalized };
-        let marker_path = source_path.replace('\\', "/").to_ascii_lowercase();
-        has_wal_marker |= marker_path == "skin.xml" || marker_path.ends_with("/skin.xml");
-        has_classic_marker |= marker_path == "main.bmp" || marker_path.ends_with("/main.bmp");
-
         if let Some(path) = &output_path {
+            let marker_path = path.to_ascii_lowercase();
+            has_wal_marker |= marker_path == "skin.xml" || marker_path.ends_with("/skin.xml");
+            has_classic_marker |= marker_path == "main.bmp" || marker_path.ends_with("/main.bmp");
             // Lowercase keys also catch collisions on case-insensitive filesystems.
             let key = path.to_lowercase();
             if !names.insert(key.clone()) {
@@ -117,7 +117,7 @@ pub fn inventory(bytes: &[u8]) -> Result<Manifest, String> {
             size,
             resource: resource_kind(&source_path),
             extracted: false,
-            bytes: content,
+            bytes: content.into(),
         });
     }
 
@@ -178,6 +178,26 @@ pub fn extract(bytes: &[u8], destination: &Path) -> Result<Manifest, String> {
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             entry.extracted = true;
         }
+        let semantics = crate::semantics::inspect(
+            manifest.archive_kind,
+            manifest.entries.iter().filter_map(|entry| {
+                entry
+                    .output_path
+                    .as_deref()
+                    .map(|path| (path, entry.bytes.clone()))
+            }),
+        );
+        let semantics_path = destination.join("semantics.json");
+        let semantics_json = serde_json::to_vec_pretty(&semantics).map_err(|e| e.to_string())?;
+        let mut semantics_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&semantics_path)
+            .map_err(|e| format!("{}: {e}", semantics_path.display()))?;
+        semantics_file
+            .write_all(&semantics_json)
+            .map_err(|e| format!("{}: {e}", semantics_path.display()))?;
+
         let path = destination.join("manifest.json");
         let json = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
@@ -307,6 +327,34 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(json["format_version"], 1);
         assert_eq!(json["entries"][0]["size"], 6);
+        let semantics: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("semantics.json")).unwrap()).unwrap();
+        assert_eq!(semantics["archive_kind"], "wsz");
+        assert_eq!(semantics["classic"]["regions"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unpack_wal_writes_static_semantics_and_keeps_scripts_as_assets() {
+        let bytes = archive(&[
+            (
+                "skin.xml",
+                br#"<WasabiXML version="1"><skininfo><name>Static</name></skininfo><container id="main"><layout id="normal" w="64" h="32"/></container></WasabiXML>"#,
+            ),
+            ("scripts/load.maki", b"opaque script bytes"),
+        ]);
+        let dir = scratch("modern");
+        let _ = std::fs::remove_dir_all(&dir);
+        extract(&bytes, &dir).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("assets/scripts/load.maki")).unwrap(),
+            b"opaque script bytes"
+        );
+        let semantics: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("semantics.json")).unwrap()).unwrap();
+        assert_eq!(semantics["modern"]["skin_info"]["name"], "Static");
+        assert_eq!(semantics["modern"]["scripts"][0], "scripts/load.maki");
+        assert!(semantics["modern"]["windows"].is_null());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -381,6 +429,7 @@ mod tests {
             )
             .unwrap();
         let manifest = inventory(&writer.finish().unwrap().into_inner()).unwrap();
+        assert_eq!(manifest.archive_kind, "unknown");
         assert_eq!(manifest.entries[0].output_path, None);
         assert!(!manifest.entries[0].extracted);
     }
@@ -394,6 +443,15 @@ mod tests {
             inventory(&archive(&[("readme", b"text")]))
                 .unwrap()
                 .archive_kind,
+            "unknown"
+        );
+        assert_eq!(
+            inventory(&archive(&[
+                ("../skin.xml", b"<WasabiXML/>"),
+                ("../main.bmp", b"x")
+            ]))
+            .unwrap()
+            .archive_kind,
             "unknown"
         );
     }

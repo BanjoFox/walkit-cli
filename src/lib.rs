@@ -13,5 +13,6 @@ pub mod params;
 pub mod player;
 pub mod render;
 pub mod schema;
+pub mod semantics;
 pub mod shot;
 pub mod skin;

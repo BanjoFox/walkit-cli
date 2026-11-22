@@ -51,7 +51,8 @@ walkit render https://example.org/skin.wal -o preview.png
 
 ### Static archive inventory (provisional)
 
-`unpack` writes a provisional version 1 `manifest.json` and entry contents below `assets/`.
+`unpack` writes a provisional version 1 `manifest.json`, a provisional version 1
+`semantics.json`, and entry contents below `assets/`.
 The destination must be a new directory. It inspects archive paths and file extensions only;
 it does not run skin scripts or claim that every resource can be interpreted by another player.
 Unknown resources are marked `opaque` and retained. Unsafe paths and symbolic links are
@@ -70,6 +71,14 @@ classification, and an `extracted` flag. Resource labels are `image`, `audio`, `
 `text_or_archive`, and `opaque`. This is documentation for an experimental prototype, not a
 canonical public schema; incompatible changes require a `format_version` change if the
 prototype is retained.
+
+`semantics.json` uses existing static parsers from `walkit`. For classic skins it summarizes
+available sheets, playlist colors/font, visualizer colors, region names and cursors. For modern
+skins it summarizes author metadata, declared containers, script/font paths, and plugin
+references. Modern layout geometry and runtime-created windows are not represented: the source
+XML remains available under `assets/`, while scripts remain opaque and are never run.
+For safety, static XML summaries are skipped with a diagnostic when nesting exceeds 128 levels
+or the archive contains over 10,000 XML elements; the original XML is still extracted.
 
 ### Many skins
 
