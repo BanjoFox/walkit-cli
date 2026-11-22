@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use md5::{Digest, Md5};
 use walkit::files::MemoryFiles;
 
+use walkit_cli::archive_export;
 use walkit_cli::compare::compare;
 use walkit_cli::info;
 use walkit_cli::input::{self, Source};
@@ -30,6 +31,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inventory a skin archive and extract its original file bytes into a directory.
+    Unpack(Unpack),
     /// Render one skin or many to PNG files.
     Render(Render),
     /// Print the default parameters, the Winamp Skin Museum's screenshot state, as a
@@ -45,6 +48,14 @@ enum Command {
     /// Print what is known about skins: who made them, what is in them, and what the
     /// engine makes of them.
     Info(Info),
+}
+
+#[derive(clap::Args)]
+struct Unpack {
+    /// A local .wsz or .wal archive.
+    input: PathBuf,
+    /// New directory to create; it must not already exist.
+    output: PathBuf,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -151,6 +162,26 @@ fn default_jobs() -> usize {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Unpack(args) => {
+            match archive_export::read_archive(&args.input)
+                .and_then(|bytes| archive_export::extract(&bytes, &args.output))
+            {
+                Ok(manifest) => {
+                    println!(
+                        "{}: {} entries inventoried, {} extracted",
+                        manifest.archive_kind,
+                        manifest.entries.len(),
+                        manifest
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.extracted)
+                            .count()
+                    );
+                    Ok(true)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Command::Render(args) => render(args),
         Command::Params => {
             print!("{}", Params::default().to_json());

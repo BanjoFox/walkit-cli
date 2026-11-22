@@ -49,6 +49,28 @@ walkit render skin.wsz -o preview.png
 walkit render https://example.org/skin.wal -o preview.png
 ```
 
+### Static archive inventory (provisional)
+
+`unpack` writes a provisional version 1 `manifest.json` and entry contents below `assets/`.
+The destination must be a new directory. It inspects archive paths and file extensions only;
+it does not run skin scripts or claim that every resource can be interpreted by another player.
+Unknown resources are marked `opaque` and retained. Unsafe paths and symbolic links are
+listed without extraction. Entry contents are copied unchanged; ZIP compression, metadata,
+and the original encoded path bytes are not preserved.
+
+```
+walkit unpack skin.wsz unpacked-skin/
+walkit unpack skin.wal unpacked-skin/
+```
+
+The manifest's provisional fields are `format_version` (`1`), `archive_kind` (`wsz`, `wal`,
+`mixed`, or `unknown`), and `entries`. Each entry has the decoded `source_path`, nullable
+`output_path` relative to `assets/`, uncompressed `size`, extension-based `resource`
+classification, and an `extracted` flag. Resource labels are `image`, `audio`, `font`,
+`text_or_archive`, and `opaque`. This is documentation for an experimental prototype, not a
+canonical public schema; incompatible changes require a `format_version` change if the
+prototype is retained.
+
 ### Many skins
 
 Inputs are files, http(s) addresses and folders, in any mix. A folder stands for the `.wsz`,
