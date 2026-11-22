@@ -73,7 +73,8 @@ canonical public schema; incompatible changes require a `format_version` change 
 prototype is retained.
 
 `semantics.json` uses existing static parsers from `walkit`. For classic skins it summarizes
-available sheets, playlist colors/font, visualizer colors, region names and cursors. For modern
+available sheets, playlist colors/font, visualizer colors, region names and polygon coordinates,
+and cursors. For modern
 skins it summarizes author metadata, declared containers and layouts, element attributes,
 script/font paths, and plugin references. Layout geometry and attribute values remain strings;
 the summary does not calculate runtime window positions or script-driven changes. The source

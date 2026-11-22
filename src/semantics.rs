@@ -30,7 +30,21 @@ pub struct ClassicSemantics {
     pub playlist: Option<PlaylistStyle>,
     pub visualizer_colors: Vec<String>,
     pub regions: Vec<String>,
+    /// Polygon coordinates from `region.txt`, ordered by section then polygon.
+    pub region_geometry: Vec<RegionGeometry>,
     pub cursors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegionGeometry {
+    pub section: String,
+    pub polygons: Vec<Vec<RegionPoint>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegionPoint {
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +144,30 @@ pub fn inspect<'a>(
     let (classic, modern) = match archive_kind {
         "wsz" => {
             let info = walkit::info::classic(&files);
+            let region_geometry = files
+                .read("region.txt")
+                .map(|bytes| walkit::info::decode(&bytes))
+                .map(|text| walkit::classic::region::parse(&text))
+                .map(|regions| {
+                    let mut regions: Vec<_> = regions.into_iter().collect();
+                    regions.sort_by(|a, b| a.0.cmp(&b.0));
+                    regions
+                        .into_iter()
+                        .map(|(section, polygons)| RegionGeometry {
+                            section,
+                            polygons: polygons
+                                .into_iter()
+                                .map(|points| {
+                                    points
+                                        .into_iter()
+                                        .map(|(x, y)| RegionPoint { x, y })
+                                        .collect()
+                                })
+                                .collect(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let playlist = info.playlist.map(|p| PlaylistStyle {
                 normal: color(p.normal),
                 current: color(p.current),
@@ -144,6 +182,7 @@ pub fn inspect<'a>(
                     playlist,
                     visualizer_colors: info.vis_colors.into_iter().map(color).collect(),
                     regions: info.regions,
+                    region_geometry,
                     cursors: info.cursors,
                 }),
                 None,
@@ -383,7 +422,7 @@ mod tests {
             ),
             (
                 "pack/skin/region.txt",
-                Rc::from(&b"[Normal]\nPointList=0,0,1,1\n"[..]),
+                Rc::from(&b"[Normal]\nNumPoints=4\nPointList=0,0,10,0,10,10,0,10\n"[..]),
             ),
             ("other/readme.txt", Rc::from(&b"not part of the skin"[..])),
         ];
@@ -394,6 +433,9 @@ mod tests {
         assert_eq!(playlist.normal, "#123456");
         assert_eq!(playlist.font, "Tahoma");
         assert_eq!(classic.regions, ["normal"]);
+        assert_eq!(classic.region_geometry[0].section, "normal");
+        assert_eq!(classic.region_geometry[0].polygons[0][2].x, 10);
+        assert_eq!(classic.region_geometry[0].polygons[0][2].y, 10);
     }
 
     #[test]

@@ -301,6 +301,10 @@ mod tests {
     fn inventories_and_extracts_wsz_bytes_and_opaque_resources() {
         let bytes = archive(&[
             ("main.bmp", b"bitmap"),
+            (
+                "region.txt",
+                b"[Normal]\nNumPoints=3\nPointList=0,0,8,0,8,8\n",
+            ),
             ("scripts/run.js", b"do not run"),
             ("mystery.bin", b"opaque"),
         ]);
@@ -330,7 +334,14 @@ mod tests {
         let semantics: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("semantics.json")).unwrap()).unwrap();
         assert_eq!(semantics["archive_kind"], "wsz");
-        assert_eq!(semantics["classic"]["regions"], serde_json::json!([]));
+        assert_eq!(
+            semantics["classic"]["regions"],
+            serde_json::json!(["normal"])
+        );
+        assert_eq!(
+            semantics["classic"]["region_geometry"][0]["polygons"][0][1]["x"],
+            8
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
