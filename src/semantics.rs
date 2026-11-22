@@ -47,10 +47,38 @@ pub struct ModernSemantics {
     pub skin_info: SkinMetadata,
     pub format_version: Option<String>,
     pub containers: Vec<ContainerMetadata>,
+    /// Declared layouts and their static element trees, with source attributes kept as text.
+    pub layouts: Vec<LayoutMetadata>,
     /// Compiled script files are listed as opaque dependencies; they are never run or decoded.
     pub scripts: Vec<String>,
     pub fonts: Vec<String>,
     pub plugins: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LayoutMetadata {
+    /// Entry path below the extracted `assets/` directory.
+    pub source_file: String,
+    pub container_id: Option<String>,
+    pub id: Option<String>,
+    pub width: Option<String>,
+    pub height: Option<String>,
+    pub attributes: Vec<StaticAttribute>,
+    pub elements: Vec<StaticElement>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StaticAttribute {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StaticElement {
+    pub tag: String,
+    pub attributes: Vec<StaticAttribute>,
+    pub text: Option<String>,
+    pub children: Vec<StaticElement>,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +166,7 @@ pub fn inspect<'a>(
                 (None, None)
             } else {
                 let info = walkit::info::modern(&files);
+                let layouts = layouts(&files, skin_folder.as_deref().unwrap_or_default());
                 let i = info.skin_info;
                 let skin_info = SkinMetadata {
                     name: i.name,
@@ -164,6 +193,7 @@ pub fn inspect<'a>(
                         skin_info,
                         format_version: info.format_version,
                         containers,
+                        layouts,
                         scripts: info.scripts,
                         fonts: info.fonts,
                         plugins: info.plugins,
@@ -249,6 +279,82 @@ fn find_after(bytes: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
         .map(|offset| start + offset + needle.len())
 }
 
+fn layouts(files: &MemoryFiles, folder: &str) -> Vec<LayoutMetadata> {
+    let mut layouts = Vec::new();
+    for path in files.names() {
+        if !path.to_ascii_lowercase().ends_with(".xml") {
+            continue;
+        }
+        let Some(bytes) = files.read(&path) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for root in walkit::xml::parse(&text) {
+            collect_layouts(&root, &format!("{folder}{path}"), None, &mut layouts);
+        }
+    }
+    layouts
+}
+
+fn collect_layouts(
+    node: &walkit::xml::XmlNode,
+    source_file: &str,
+    parent_container: Option<&str>,
+    out: &mut Vec<LayoutMetadata>,
+) {
+    let container = if node.name == "container" {
+        node.get("id").or(parent_container)
+    } else {
+        parent_container
+    };
+    if node.name == "layout" {
+        out.push(LayoutMetadata {
+            source_file: source_file.to_string(),
+            container_id: container.map(str::to_string),
+            id: node.get("id").map(str::to_string),
+            width: node.get("w").map(str::to_string),
+            height: node.get("h").map(str::to_string),
+            attributes: node
+                .attrs
+                .iter()
+                .map(|(name, value)| StaticAttribute {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            elements: node
+                .children
+                .iter()
+                .map(|child| static_element(child.as_ref()))
+                .collect(),
+        });
+        return;
+    }
+    for child in &node.children {
+        collect_layouts(child, source_file, container, out);
+    }
+}
+
+fn static_element(node: &walkit::xml::XmlNode) -> StaticElement {
+    StaticElement {
+        tag: node.name.clone(),
+        attributes: node
+            .attrs
+            .iter()
+            .map(|(name, value)| StaticAttribute {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        text: (!node.text.is_empty()).then(|| node.text.clone()),
+        children: node
+            .children
+            .iter()
+            .map(|child| static_element(child.as_ref()))
+            .collect(),
+    }
+}
+
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
         bytes = &bytes[1..];
@@ -295,7 +401,7 @@ mod tests {
         let entries = [
             (
                 "skin.xml",
-                Rc::from(&br#"<WasabiXML version="1.2"><skininfo><name>Static Test</name><author>Fox</author></skininfo><container id="main" name="Main" default_visible="1"><layout id="normal" w="320" h="200"/></container></WasabiXML>"#[..]),
+                Rc::from(&br#"<WasabiXML version="1.2"><skininfo><name>Static Test</name><author>Fox</author></skininfo><container id="main" name="Main" default_visible="1"><layout id="normal" w="320" h="200"><layer id="bg" x="12" y="24" w="50" h="40"><image source="main.bmp"/></layer></layout></container></WasabiXML>"#[..]),
             ),
             (
                 "scripts/loader.maki",
@@ -309,8 +415,18 @@ mod tests {
         assert_eq!(modern.format_version.as_deref(), Some("1.2"));
         assert_eq!(modern.containers[0].id, "main");
         assert_eq!(modern.scripts, ["scripts/loader.maki"]);
-        // Layout geometry is kept in source XML, rather than represented as runtime data.
-        assert_eq!(modern.containers.len(), 1);
+        assert_eq!(modern.layouts[0].source_file, "skin.xml");
+        assert_eq!(modern.layouts[0].container_id.as_deref(), Some("main"));
+        assert_eq!(modern.layouts[0].id.as_deref(), Some("normal"));
+        assert_eq!(modern.layouts[0].width.as_deref(), Some("320"));
+        assert_eq!(modern.layouts[0].height.as_deref(), Some("200"));
+        assert_eq!(modern.layouts[0].elements[0].tag, "layer");
+        assert_eq!(modern.layouts[0].elements[0].attributes[1].value, "12");
+        assert_eq!(modern.layouts[0].elements[0].children[0].tag, "image");
+        assert_eq!(
+            modern.layouts[0].elements[0].children[0].attributes[0].value,
+            "main.bmp"
+        );
     }
 
     #[test]

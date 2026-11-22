@@ -74,8 +74,9 @@ prototype is retained.
 
 `semantics.json` uses existing static parsers from `walkit`. For classic skins it summarizes
 available sheets, playlist colors/font, visualizer colors, region names and cursors. For modern
-skins it summarizes author metadata, declared containers, script/font paths, and plugin
-references. Modern layout geometry and runtime-created windows are not represented: the source
+skins it summarizes author metadata, declared containers and layouts, element attributes,
+script/font paths, and plugin references. Layout geometry and attribute values remain strings;
+the summary does not calculate runtime window positions or script-driven changes. The source
 XML remains available under `assets/`, while scripts remain opaque and are never run.
 For safety, static XML summaries are skipped with a diagnostic when nesting exceeds 128 levels
 or the archive contains over 10,000 XML elements; the original XML is still extracted.

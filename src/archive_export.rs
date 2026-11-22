@@ -339,7 +339,7 @@ mod tests {
         let bytes = archive(&[
             (
                 "skin.xml",
-                br#"<WasabiXML version="1"><skininfo><name>Static</name></skininfo><container id="main"><layout id="normal" w="64" h="32"/></container></WasabiXML>"#,
+                br#"<WasabiXML version="1"><skininfo><name>Static</name></skininfo><container id="main"><layout id="normal" w="64" h="32"><layer x="4" y="5"/></layout></container></WasabiXML>"#,
             ),
             ("scripts/load.maki", b"opaque script bytes"),
         ]);
@@ -354,6 +354,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join("semantics.json")).unwrap()).unwrap();
         assert_eq!(semantics["modern"]["skin_info"]["name"], "Static");
         assert_eq!(semantics["modern"]["scripts"][0], "scripts/load.maki");
+        assert_eq!(semantics["modern"]["layouts"][0]["width"], "64");
+        assert_eq!(
+            semantics["modern"]["layouts"][0]["elements"][0]["tag"],
+            "layer"
+        );
         assert!(semantics["modern"]["windows"].is_null());
         let _ = std::fs::remove_dir_all(dir);
     }
