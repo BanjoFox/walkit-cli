@@ -68,6 +68,8 @@ pub struct ModernSemantics {
     pub xml_documents: Vec<XmlDocumentMetadata>,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     pub file_references: Vec<XmlFileReference>,
+    /// Literal layout attributes used by walkit's runtime as bitmap names; matching is lexical.
+    pub bitmap_references: Vec<BitmapReference>,
     /// Compiled script files are listed as opaque dependencies; they are never run or decoded.
     pub scripts: Vec<String>,
     pub fonts: Vec<String>,
@@ -99,6 +101,19 @@ pub struct XmlFileReference {
     pub path: String,
     /// `None` means the runtime generates or substitutes this resource path.
     pub archive_file_present: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BitmapReference {
+    pub source_file: String,
+    pub element_tag: String,
+    pub element_id: Option<String>,
+    pub attribute: String,
+    pub target: String,
+    /// Exact case-insensitive bitmap declaration IDs found in any scanned XML source file.
+    pub matching_declaration_files: Vec<String>,
+    /// Whether the target is also a literal archive path (walkit permits this fallback).
+    pub archive_file_present: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,8 +252,7 @@ pub fn inspect<'a>(
                 (None, None)
             } else {
                 let info = walkit::info::modern(&files);
-                let (layouts, xml_documents, duplicate_declarations, file_references) =
-                    inspect_xml_documents(&files, skin_folder.as_deref().unwrap_or_default());
+                let xml = inspect_xml_documents(&files, skin_folder.as_deref().unwrap_or_default());
                 let i = info.skin_info;
                 let skin_info = SkinMetadata {
                     name: i.name,
@@ -263,10 +277,11 @@ pub fn inspect<'a>(
                     skin_info,
                     format_version: info.format_version,
                     containers,
-                    layouts,
-                    xml_documents,
-                    duplicate_declarations,
-                    file_references,
+                    layouts: xml.layouts,
+                    xml_documents: xml.documents,
+                    duplicate_declarations: xml.duplicate_declarations,
+                    file_references: xml.file_references,
+                    bitmap_references: xml.bitmap_references,
                     scripts: info.scripts,
                     fonts: info.fonts,
                     plugins: info.plugins,
@@ -352,19 +367,20 @@ fn find_after(bytes: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
         .map(|offset| start + offset + needle.len())
 }
 
-fn inspect_xml_documents(
-    files: &MemoryFiles,
-    folder: &str,
-) -> (
-    Vec<LayoutMetadata>,
-    Vec<XmlDocumentMetadata>,
-    Vec<DuplicateDeclaration>,
-    Vec<XmlFileReference>,
-) {
+struct XmlInspection {
+    layouts: Vec<LayoutMetadata>,
+    documents: Vec<XmlDocumentMetadata>,
+    duplicate_declarations: Vec<DuplicateDeclaration>,
+    file_references: Vec<XmlFileReference>,
+    bitmap_references: Vec<BitmapReference>,
+}
+
+fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
     let mut layouts = Vec::new();
     let mut documents = Vec::new();
     let mut declarations: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut file_references = Vec::new();
+    let mut raw_bitmap_references = Vec::new();
     for path in files.names() {
         if !path.to_ascii_lowercase().ends_with(".xml") {
             continue;
@@ -384,6 +400,7 @@ fn inspect_xml_documents(
                 definitions: &mut definitions,
                 declarations: &mut declarations,
                 file_references: &mut file_references,
+                bitmap_references: &mut raw_bitmap_references,
             };
             for root in walkit::xml::parse(&text) {
                 scan.node(&root, &source_file, None);
@@ -395,6 +412,11 @@ fn inspect_xml_documents(
             definitions,
         });
     }
+    let bitmap_declaration_files: HashMap<_, _> = declarations
+        .iter()
+        .filter(|((tag, _), _)| tag == "bitmap")
+        .map(|((_, id), files)| (id.clone(), files.clone()))
+        .collect();
     let mut duplicate_declarations: Vec<_> = declarations
         .into_iter()
         .filter(|(_, source_files)| source_files.len() > 1)
@@ -408,8 +430,36 @@ fn inspect_xml_documents(
         })
         .collect();
     duplicate_declarations.sort_by(|a, b| (&a.tag, &a.id).cmp(&(&b.tag, &b.id)));
-    (layouts, documents, duplicate_declarations, file_references)
+    let bitmap_references = raw_bitmap_references
+        .into_iter()
+        .map(
+            |(source_file, element_tag, element_id, attribute, target)| {
+                let matching_declaration_files = bitmap_declaration_files
+                    .get(&target.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
+                BitmapReference {
+                    source_file,
+                    element_tag,
+                    element_id,
+                    attribute,
+                    archive_file_present: files.exists(&target),
+                    target,
+                    matching_declaration_files,
+                }
+            },
+        )
+        .collect();
+    XmlInspection {
+        layouts,
+        documents,
+        duplicate_declarations,
+        file_references,
+        bitmap_references,
+    }
 }
+
+type RawBitmapReference = (String, String, Option<String>, String, String);
 
 struct XmlScan<'a> {
     files: &'a MemoryFiles,
@@ -418,6 +468,7 @@ struct XmlScan<'a> {
     definitions: &'a mut Vec<StaticElement>,
     declarations: &'a mut HashMap<(String, String), Vec<String>>,
     file_references: &'a mut Vec<XmlFileReference>,
+    bitmap_references: &'a mut Vec<RawBitmapReference>,
 }
 
 impl XmlScan<'_> {
@@ -470,6 +521,31 @@ impl XmlScan<'_> {
                 });
             }
         }
+        const BITMAP_ATTRIBUTES: [&str; 12] = [
+            "image",
+            "downimage",
+            "hoverimage",
+            "activeimage",
+            "inactiveimage",
+            "thumb",
+            "downthumb",
+            "barleft",
+            "barmiddle",
+            "barright",
+            "background",
+            "images",
+        ];
+        for (attribute, target) in &node.attrs {
+            if BITMAP_ATTRIBUTES.contains(&attribute.as_str()) {
+                self.bitmap_references.push((
+                    source_file.to_string(),
+                    node.name.clone(),
+                    node.get("id").map(str::to_string),
+                    attribute.clone(),
+                    target.clone(),
+                ));
+            }
+        }
         if node.name == "layout" {
             self.layouts.push(LayoutMetadata {
                 source_file: source_file.to_string(),
@@ -491,7 +567,6 @@ impl XmlScan<'_> {
                     .map(|child| static_element(child.as_ref()))
                     .collect(),
             });
-            return;
         }
         for child in &node.children {
             self.node(child, source_file, container);
@@ -601,7 +676,7 @@ mod tests {
         let entries = [
             (
                 "skin.xml",
-                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><elements><bitmap id="Logo" file="img/logo.png"/></elements></WasabiXML>"#[..]),
+                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><elements><bitmap id="Logo" file="img/logo.png"/></elements><container id="main"><layout id="normal"><button id="close" image="logo"/><button id="bad" image="not-declared"/></layout></container></WasabiXML>"#[..]),
             ),
             (
                 "parts/ui.xml",
@@ -634,6 +709,21 @@ mod tests {
         assert_eq!(present("img/missing.png"), Some(false));
         assert_eq!(present("$solid"), None);
         assert_eq!(present("scripts/loader.maki"), Some(true));
+        let bitmap_ref = |target: &str| {
+            modern
+                .bitmap_references
+                .iter()
+                .find(|reference| reference.target == target)
+                .unwrap()
+        };
+        assert_eq!(
+            bitmap_ref("logo").matching_declaration_files,
+            ["parts/ui.xml", "skin.xml"]
+        );
+        assert!(!bitmap_ref("logo").archive_file_present);
+        assert!(bitmap_ref("not-declared")
+            .matching_declaration_files
+            .is_empty());
     }
 
     #[test]

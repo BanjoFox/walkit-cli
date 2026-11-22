@@ -79,10 +79,14 @@ element attributes, and source XML documents. Each document records literal incl
 direct `<elements>` definitions; resource references record whether the literal archive path
 exists, and repeated IDs are reported as duplicate declarations. These are source declarations,
 not a resolved include graph: the summary does not identify loaded documents, reachable
-definitions, or active layouts. Layout geometry and attribute values remain strings; the summary
-does not calculate runtime window positions or script-driven changes. Script/font paths are
-recorded, but execution and runtime reachability are never inferred. Source XML remains
-available under `assets/`, while scripts remain opaque and are never run.
+definitions, or active layouts. Recognized bitmap attributes in the source are reported with
+case-insensitive lexical matches to bitmap declaration IDs and literal archive-path presence.
+This does not resolve aliases, include order, old-style bitmap names, base-skin resources, or
+runtime substitutions; an unmatched source reference is not proof that the runtime cannot
+resolve it. Layout geometry and attribute values remain strings; the summary does not calculate
+runtime window positions or script-driven changes. Script/font paths are recorded, but execution
+and runtime reachability are never inferred. Source XML remains available under `assets/`,
+while scripts remain opaque and are never run.
 For safety, static XML summaries are skipped with a diagnostic when nesting exceeds 128 levels
 or the archive contains over 10,000 XML elements; the original XML is still extracted.
 

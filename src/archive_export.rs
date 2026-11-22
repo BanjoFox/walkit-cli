@@ -433,6 +433,15 @@ mod tests {
                         .iter()
                         .any(|attribute| attribute["name"] == "id" && attribute["value"] == "close")
             }));
+        assert!(semantics["bitmap_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| {
+                reference["target"] == "close"
+                    && reference["attribute"] == "image"
+                    && reference["matching_declaration_files"] == serde_json::json!(["skin.xml"])
+            }));
 
         let _ = std::fs::remove_dir_all(classic_dir);
         let _ = std::fs::remove_dir_all(modern_dir);
