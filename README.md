@@ -85,7 +85,8 @@ definitions, or active layouts. Recognized bitmap attributes in the source are r
 case-insensitive lexical matches to bitmap declaration IDs and literal archive-path presence.
 This does not resolve aliases, include order, old-style bitmap names, base-skin resources, or
 runtime substitutions; an unmatched source reference is not proof that the runtime cannot
-resolve it. Layout geometry and attribute values remain strings; the summary does not calculate
+resolve it. Direct `elementalias` ID declarations are reported, but alias targets and chains are
+not followed. Layout geometry and attribute values remain strings; the summary does not calculate
 runtime window positions or script-driven changes. Script/font paths are recorded, but execution
 and runtime reachability are never inferred. Source XML remains available under `assets/`,
 while scripts remain opaque and are never run.

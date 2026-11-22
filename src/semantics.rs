@@ -122,6 +122,8 @@ pub struct BitmapReference {
     pub target: String,
     /// Exact case-insensitive bitmap declaration IDs found in any scanned XML source file.
     pub matching_declaration_files: Vec<String>,
+    /// Direct alias IDs found in source; target chains are not resolved.
+    pub matching_alias_declaration_files: Vec<String>,
     /// Whether the target is also a literal archive path (walkit permits this fallback).
     pub archive_file_present: bool,
 }
@@ -439,6 +441,11 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
         .filter(|((tag, _), _)| tag == "bitmap")
         .map(|((_, id), files)| (id.clone(), files.clone()))
         .collect();
+    let alias_declaration_files: HashMap<_, _> = declarations
+        .iter()
+        .filter(|((tag, _), _)| tag == "elementalias")
+        .map(|((_, id), files)| (id.clone(), files.clone()))
+        .collect();
     let mut duplicate_declarations: Vec<_> = declarations
         .into_iter()
         .filter(|(_, source_files)| source_files.len() > 1)
@@ -460,6 +467,10 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
                     .get(&target.to_ascii_lowercase())
                     .cloned()
                     .unwrap_or_default();
+                let matching_alias_declaration_files = alias_declaration_files
+                    .get(&target.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
                 BitmapReference {
                     source_file,
                     element_tag,
@@ -468,6 +479,7 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
                     archive_file_present: files.exists(&target),
                     target,
                     matching_declaration_files,
+                    matching_alias_declaration_files,
                 }
             },
         )
@@ -525,7 +537,7 @@ impl XmlScan<'_> {
         if let Some(id) = node.get("id") {
             if matches!(
                 node.name.as_str(),
-                "bitmap" | "bitmapfont" | "color" | "container" | "truetypefont"
+                "bitmap" | "bitmapfont" | "color" | "container" | "elementalias" | "truetypefont"
             ) {
                 self.declarations
                     .entry((node.name.clone(), id.to_ascii_lowercase()))
@@ -703,11 +715,11 @@ mod tests {
         let entries = [
             (
                 "skin.xml",
-                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><include file="missing.xml"/><elements><bitmap id="Logo" file="img/logo.png"/></elements><container id="main"><layout id="normal"><button id="close" image="logo"/><button id="bad" image="not-declared"/></layout></container></WasabiXML>"#[..]),
+                Rc::from(&br#"<WasabiXML><include file="parts/ui.xml"/><include file="missing.xml"/><elements><bitmap id="Logo" file="img/logo.png"/><elementalias id="logoAlias" target="logo"/></elements><container id="main"><layout id="normal"><button id="close" image="logo"/><button id="alias" image="logoAlias"/><button id="bad" image="not-declared"/></layout></container></WasabiXML>"#[..]),
             ),
             (
                 "parts/ui.xml",
-                Rc::from(&br#"<elements><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><script id="loader" file="scripts/loader.maki"/></elements>"#[..]),
+                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><script id="loader" file="scripts/loader.maki"/></elements>"#[..]),
             ),
             ("img/logo.png", Rc::from(&b"logo"[..])),
             ("img/alternate.png", Rc::from(&b"alternate"[..])),
@@ -722,10 +734,12 @@ mod tests {
             ["parts/ui.xml", "missing.xml"]
         );
         assert_eq!(modern.xml_documents[1].definitions[0].tag, "bitmap");
-        assert_eq!(modern.duplicate_declarations.len(), 1);
+        assert_eq!(modern.duplicate_declarations.len(), 2);
         assert_eq!(modern.duplicate_declarations[0].tag, "bitmap");
         assert_eq!(modern.duplicate_declarations[0].id, "logo");
         assert_eq!(modern.duplicate_declarations[0].source_files.len(), 2);
+        assert_eq!(modern.duplicate_declarations[1].tag, "elementalias");
+        assert_eq!(modern.duplicate_declarations[1].id, "logoalias");
         let present = |path: &str| {
             modern
                 .file_references
@@ -757,6 +771,10 @@ mod tests {
         assert!(bitmap_ref("not-declared")
             .matching_declaration_files
             .is_empty());
+        assert_eq!(
+            bitmap_ref("logoAlias").matching_alias_declaration_files,
+            ["parts/ui.xml", "skin.xml"]
+        );
     }
 
     #[test]
