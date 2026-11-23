@@ -755,6 +755,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_reference_attributes_preserve_absent_and_empty_distinctions() {
+        let entries = [(
+            "skin.xml",
+            Rc::from(&br#"<WasabiXML><include/><include file=""/><elements><bitmap id="no-file"/><bitmap id="empty-file" file=""/><bitmapfont id="font-no-file"/></elements><container id="main"><layout id="normal"><button id="no-image"/><button id="empty-image" image=""/></layout></container></WasabiXML>"#[..]),
+        )];
+        let semantics = inspect("wal", entries);
+        let modern = semantics.modern.unwrap();
+        assert_eq!(modern.xml_include_references.len(), 1);
+        assert_eq!(modern.xml_include_references[0].target, "");
+        assert!(!modern.xml_include_references[0].root_entry_present);
+        assert_eq!(modern.file_references.len(), 1);
+        assert_eq!(modern.file_references[0].tag, "bitmap");
+        assert_eq!(modern.file_references[0].id.as_deref(), Some("empty-file"));
+        assert_eq!(modern.file_references[0].path, "");
+        assert_eq!(modern.file_references[0].archive_file_present, Some(false));
+        assert_eq!(modern.bitmap_references.len(), 1);
+        assert_eq!(
+            modern.bitmap_references[0].element_id.as_deref(),
+            Some("empty-image")
+        );
+        assert_eq!(modern.bitmap_references[0].target, "");
+        assert!(!modern.bitmap_references[0].archive_file_present);
+    }
+
+    #[test]
     fn declaration_and_reference_ids_use_walkits_unicode_lowercase_convention() {
         let entries = [(
             "skin.xml",
