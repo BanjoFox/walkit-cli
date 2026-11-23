@@ -7,9 +7,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,7 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VALIDATION_NODES: usize = MAX_ENTRIES * 2;
 const MAX_VALIDATION_DEPTH: usize = 2048;
 const MAX_VALIDATION_PATH_BYTES: usize = MAX_MANIFEST_BYTES as usize;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize)]
 pub struct Manifest {
@@ -62,6 +64,14 @@ struct EntrySnapshot {
     extracted: bool,
     #[serde(default)]
     sha256: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RepackReport {
+    pub archive_kind: &'static str,
+    pub entries: usize,
+    pub legacy_unverified: usize,
+    pub cleanup_warning: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -428,6 +438,271 @@ pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> 
     report.unsafe_paths.sort();
     report.unsafe_paths.dedup();
     Ok(report)
+}
+
+/// Rebuild a classic or modern skin archive from a validated unpacked directory.
+/// Edited files are included; added, missing, unsafe, and unextracted resources are rejected.
+/// The destination is installed with a no-overwrite hard link after ZIP verification.
+pub fn repack_directory(directory: &Path, destination: &Path) -> Result<RepackReport, String> {
+    let validation = validate_directory(directory)?;
+    let source_root =
+        fs::canonicalize(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+    let destination_parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| "archive destination must name a file".to_string())?
+        .to_os_string();
+    let destination_parent = fs::canonicalize(destination_parent)
+        .map_err(|e| format!("{}: {e}", destination_parent.display()))?;
+    if destination_parent.starts_with(&source_root) {
+        return Err("archive destination must be outside the unpacked directory".into());
+    }
+    let destination = destination_parent.join(destination_name);
+    if !validation.missing.is_empty()
+        || !validation.added.is_empty()
+        || !validation.unsafe_paths.is_empty()
+    {
+        let mut reasons = Vec::new();
+        if !validation.missing.is_empty() {
+            reasons.push(format!("{} missing resources", validation.missing.len()));
+        }
+        if !validation.added.is_empty() {
+            reasons.push(format!("{} added resources", validation.added.len()));
+        }
+        if !validation.unsafe_paths.is_empty() {
+            reasons.push(format!(
+                "{} unsafe resources",
+                validation.unsafe_paths.len()
+            ));
+        }
+        return Err(format!(
+            "cannot repack: {}; run `walkit validate` for details",
+            reasons.join(", ")
+        ));
+    }
+
+    let manifest_path = directory.join("manifest.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err(format!(
+            "manifest is not a regular file: {}",
+            manifest_path.display()
+        ));
+    }
+    if manifest_metadata.len() > MAX_MANIFEST_BYTES {
+        return Err("manifest.json is too large to repack".into());
+    }
+    let mut manifest_bytes = Vec::new();
+    open_validation_file(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("manifest.json is too large to repack".into());
+    }
+    let manifest: ManifestSnapshot = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("{}: invalid manifest: {e}", manifest_path.display()))?;
+    validate_manifest(&manifest)?;
+    let archive_kind = match manifest.archive_kind.as_str() {
+        "wsz" => "wsz",
+        "wal" => "wal",
+        "mixed" | "unknown" => {
+            return Err(format!(
+                "cannot repack archive_kind {:?}; only classic (wsz) and modern (wal) skins are supported",
+                manifest.archive_kind
+            ));
+        }
+        _ => unreachable!("validate_manifest checks archive kind"),
+    };
+    let expected_extension = archive_kind;
+    if !destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected_extension))
+    {
+        return Err(format!(
+            "{} archives must use the .{expected_extension} extension",
+            if archive_kind == "wsz" {
+                "classic"
+            } else {
+                "modern"
+            }
+        ));
+    }
+
+    let assets = directory.join("assets");
+    let mut entries = Vec::with_capacity(manifest.entries.len());
+    let mut total = 0u64;
+    for (index, entry) in manifest.entries.iter().enumerate() {
+        let relative = entry.output_path.as_deref().ok_or_else(|| {
+            format!(
+                "cannot repack: manifest entry {index} ({:?}) was not safely extracted",
+                entry.source_path
+            )
+        })?;
+        if !entry.extracted {
+            return Err(format!(
+                "cannot repack: manifest entry {index} ({relative:?}) is not extracted"
+            ));
+        }
+        let path = assets.join(relative);
+        let mut file =
+            open_validation_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_ENTRY + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if bytes.len() as u64 > MAX_ENTRY {
+            return Err(format!("repacked entry is too large: {relative:?}"));
+        }
+        total = total.saturating_add(bytes.len() as u64);
+        if total > MAX_TOTAL {
+            return Err("repacked content exceeds the total size limit".into());
+        }
+        entries.push((relative.to_owned(), bytes));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let (temporary, file) = create_temporary_sibling(&destination)?;
+    let result = (|| {
+        write_zip(file, &entries)?;
+        let zip_bytes = read_archive(&temporary)?;
+        let inspected = inventory(&zip_bytes)?;
+        if inspected.archive_kind != archive_kind || inspected.entries.len() != entries.len() {
+            return Err("repacked ZIP failed skin-kind or entry-count verification".into());
+        }
+        let inspected_entries: HashMap<_, _> = inspected
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .output_path
+                    .as_ref()
+                    .map(|path| (path.as_str(), entry.sha256.as_str()))
+            })
+            .collect();
+        for (path, bytes) in &entries {
+            let digest = format!("{:x}", Sha256::digest(bytes));
+            if inspected_entries.get(path.as_str()).copied() != Some(digest.as_str()) {
+                return Err(format!(
+                    "repacked ZIP failed byte verification for {path:?}"
+                ));
+            }
+        }
+        fs::hard_link(&temporary, &destination).map_err(|e| {
+            format!(
+                "cannot create new destination {}: {e}",
+                destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        return match fs::remove_file(&temporary) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!(
+                "{error}; temporary output cleanup failed: {cleanup}"
+            )),
+        };
+    }
+    let cleanup_warning = fs::remove_file(&temporary).err().map(|error| {
+        format!(
+            "could not remove temporary file {}: {error}",
+            temporary.display()
+        )
+    });
+    Ok(RepackReport {
+        archive_kind,
+        entries: entries.len(),
+        legacy_unverified: validation.legacy_unverified,
+        cleanup_warning,
+    })
+}
+
+struct BoundedFile {
+    file: File,
+    written: u64,
+}
+
+impl Write for BoundedFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let position = self.file.stream_position()?;
+        if position.saturating_add(bytes.len() as u64) > MAX_ARCHIVE {
+            return Err(std::io::Error::other(
+                "repacked archive size limit exceeded",
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        self.written = self.written.max(position + written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for BoundedFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+fn write_zip(file: File, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let mut writer = zip::ZipWriter::new(BoundedFile { file, written: 0 });
+    for (path, bytes) in entries {
+        writer
+            .start_file(path, zip::write::SimpleFileOptions::default())
+            .map_err(|e| format!("cannot write ZIP entry {path:?}: {e}"))?;
+        writer
+            .write_all(bytes)
+            .map_err(|e| format!("cannot write ZIP entry {path:?}: {e}"))?;
+    }
+    let mut output = writer
+        .finish()
+        .map_err(|e| format!("cannot finalize ZIP archive: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("cannot flush ZIP archive: {e}"))?;
+    output
+        .file
+        .sync_all()
+        .map_err(|e| format!("cannot sync ZIP archive: {e}"))?;
+    Ok(())
+}
+
+fn create_temporary_sibling(destination: &Path) -> Result<(PathBuf, File), String> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .ok_or_else(|| "archive destination must name a file".to_string())?;
+    for _ in 0..128 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = name.to_os_string();
+        temporary_name.push(format!(".walkit-{}-{sequence}.tmp", std::process::id()));
+        let temporary = parent.join(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("{}: {error}", temporary.display())),
+        }
+    }
+    Err("could not allocate a unique temporary archive path".into())
 }
 
 fn validate_manifest(manifest: &ManifestSnapshot) -> Result<HashSet<String>, String> {
@@ -891,6 +1166,158 @@ mod tests {
         );
         assert!(semantics["modern"]["windows"].is_null());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repacks_classic_and_modern_with_edited_and_opaque_bytes() {
+        for (name, fixture, output_name, expected_kind) in [
+            (
+                "classic",
+                include_bytes!("../tests/skins/walkit-classic.wsz").as_slice(),
+                "classic.wsz",
+                "wsz",
+            ),
+            (
+                "modern",
+                include_bytes!("../tests/skins/walkit-modern.wal").as_slice(),
+                "modern.wal",
+                "wal",
+            ),
+        ] {
+            let directory = scratch(&format!("repack-{name}"));
+            let _ = fs::remove_dir_all(&directory);
+            extract(fixture, &directory).unwrap();
+            let manifest: ManifestSnapshot =
+                serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap())
+                    .unwrap();
+            let edited = manifest
+                .entries
+                .iter()
+                .find(|entry| entry.resource == "opaque")
+                .and_then(|entry| entry.output_path.as_ref())
+                .or_else(|| {
+                    manifest
+                        .entries
+                        .iter()
+                        .find_map(|entry| entry.output_path.as_ref())
+                })
+                .unwrap();
+            let edited_path = directory.join("assets").join(edited);
+            let mut bytes = fs::read(&edited_path).unwrap();
+            if let Some(first) = bytes.first_mut() {
+                *first ^= 0x5a;
+            } else {
+                bytes.push(0x5a);
+            }
+            fs::write(&edited_path, &bytes).unwrap();
+            let report = validate_directory(&directory).unwrap();
+            assert!(!report.modified.is_empty());
+
+            let output = directory.with_extension(output_name);
+            let repacked = repack_directory(&directory, &output).unwrap();
+            assert_eq!(repacked.archive_kind, expected_kind);
+            let archive_bytes = read_archive(&output).unwrap();
+            let inspected = inventory(&archive_bytes).unwrap();
+            assert_eq!(inspected.archive_kind, expected_kind);
+            assert_eq!(inspected.entries.len(), manifest.entries.len());
+            let entry = inspected
+                .entries
+                .iter()
+                .find(|entry| entry.output_path.as_deref() == Some(edited.as_str()))
+                .unwrap();
+            assert_eq!(entry.size, bytes.len() as u64);
+            assert_eq!(entry.sha256, format!("{:x}", Sha256::digest(&bytes)));
+            assert!(inspected
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].source_path <= pair[1].source_path));
+
+            let second = directory.with_extension(format!("again.{expected_kind}"));
+            repack_directory(&directory, &second).unwrap();
+            assert_eq!(fs::read(&output).unwrap(), fs::read(&second).unwrap());
+            let _ = fs::remove_file(output);
+            let _ = fs::remove_file(second);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn repack_rejects_added_missing_unsafe_and_existing_destinations() {
+        let directory = scratch("repack-reject");
+        let _ = fs::remove_dir_all(&directory);
+        extract(
+            include_bytes!("../tests/skins/walkit-classic.wsz"),
+            &directory,
+        )
+        .unwrap();
+        let output = directory.with_extension("wsz");
+
+        fs::write(directory.join("assets/added.txt"), b"added").unwrap();
+        assert!(repack_directory(&directory, &output)
+            .unwrap_err()
+            .contains("added resources"));
+        fs::remove_file(directory.join("assets/added.txt")).unwrap();
+
+        let manifest: ManifestSnapshot =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        let first = manifest
+            .entries
+            .iter()
+            .find_map(|entry| entry.output_path.as_ref())
+            .unwrap();
+        let first_path = directory.join("assets").join(first);
+        let saved = fs::read(&first_path).unwrap();
+        fs::remove_file(&first_path).unwrap();
+        assert!(repack_directory(&directory, &output)
+            .unwrap_err()
+            .contains("missing resources"));
+        fs::write(&first_path, saved).unwrap();
+
+        #[cfg(unix)]
+        {
+            let link = directory.join("assets/repack-link");
+            std::os::unix::fs::symlink("main.bmp", &link).unwrap();
+            assert!(repack_directory(&directory, &output)
+                .unwrap_err()
+                .contains("unsafe resources"));
+            fs::remove_file(link).unwrap();
+        }
+
+        fs::write(&output, b"keep existing destination").unwrap();
+        assert!(repack_directory(&directory, &output).is_err());
+        assert_eq!(fs::read(output).unwrap(), b"keep existing destination");
+        assert!(repack_directory(&directory, &directory.join("inside.wsz"))
+            .unwrap_err()
+            .contains("outside the unpacked directory"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn repacks_legacy_v1_manifests_with_an_explicit_warning_count() {
+        let directory = scratch("repack-v1");
+        let _ = fs::remove_dir_all(&directory);
+        let bytes = archive(&[("main.bmp", b"bitmap"), ("readme.dat", b"opaque")]);
+        extract(&bytes, &directory).unwrap();
+        let manifest_path = directory.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["format_version"] = serde_json::json!(1);
+        for entry in manifest["entries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("sha256");
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let output = directory.with_extension("legacy.wsz");
+        let report = repack_directory(&directory, &output).unwrap();
+        assert_eq!(report.legacy_unverified, 2);
+        assert_eq!(
+            inventory(&read_archive(&output).unwrap())
+                .unwrap()
+                .archive_kind,
+            "wsz"
+        );
+        let _ = fs::remove_file(output);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

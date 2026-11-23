@@ -180,6 +180,71 @@ fn unpacked_directory_can_be_validated_from_the_cli() {
 }
 
 #[test]
+fn unpack_edit_validate_repack_and_inspect_works_for_both_skin_kinds() {
+    let dir = Scratch::new("repack-workflow");
+    for (name, archive, extension) in [("classic", CLASSIC, "wsz"), ("modern", MODERN, "wal")] {
+        let unpacked = dir.path(&format!("{name}-unpacked"));
+        let unpack = run(&["unpack", archive, unpacked.to_str().unwrap()]);
+        assert!(unpack.status.success(), "{}", text(&unpack.stderr));
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(unpacked.join("manifest.json")).unwrap())
+                .unwrap();
+        let first_asset = manifest["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|entry| entry["output_path"].as_str())
+            .unwrap();
+        let asset_path = unpacked.join("assets").join(first_asset);
+        let mut edited_bytes = std::fs::read(&asset_path).unwrap();
+        if let Some(first) = edited_bytes.first_mut() {
+            *first ^= 0x01;
+        } else {
+            edited_bytes.push(0x01);
+        }
+        std::fs::write(&asset_path, &edited_bytes).unwrap();
+
+        let validate = run(&["validate", unpacked.to_str().unwrap()]);
+        assert_eq!(validate.status.code(), Some(1));
+        assert!(text(&validate.stdout).contains("1 modified"));
+
+        let output = dir.path(&format!("rebuilt-{name}.{extension}"));
+        let repack = run(&[
+            "repack",
+            unpacked.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ]);
+        assert!(repack.status.success(), "{}", text(&repack.stderr));
+
+        let mut rebuilt = zip::ZipArchive::new(std::fs::File::open(&output).unwrap()).unwrap();
+        assert!(rebuilt.by_name(first_asset).is_ok());
+        let mut rebuilt_asset = Vec::new();
+        rebuilt
+            .by_name(first_asset)
+            .unwrap()
+            .read_to_end(&mut rebuilt_asset)
+            .unwrap();
+        assert_eq!(rebuilt_asset, edited_bytes);
+
+        let inspected_dir = dir.path(&format!("inspected-{name}"));
+        let inspect = run(&[
+            "unpack",
+            output.to_str().unwrap(),
+            inspected_dir.to_str().unwrap(),
+        ]);
+        assert!(inspect.status.success(), "{}", text(&inspect.stderr));
+        let semantics: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(inspected_dir.join("semantics.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            semantics["archive_kind"],
+            if extension == "wsz" { "wsz" } else { "wal" }
+        );
+    }
+}
+
+#[test]
 fn validation_reports_archive_entries_that_unpack_skipped() {
     let dir = Scratch::new("unextracted-entry");
     let archive_path = dir.path("unsafe.wsz");

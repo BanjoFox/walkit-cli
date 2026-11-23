@@ -35,6 +35,8 @@ enum Command {
     Unpack(Unpack),
     /// Check an unpacked asset directory against its manifest.
     Validate(Validate),
+    /// Rebuild a .wsz or .wal archive from a validated unpacked directory.
+    Repack(Repack),
     /// Render one skin or many to PNG files.
     Render(Render),
     /// Print the default parameters, the Winamp Skin Museum's screenshot state, as a
@@ -64,6 +66,14 @@ struct Unpack {
 struct Validate {
     /// The directory written by `walkit unpack`.
     directory: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct Repack {
+    /// The directory written by `walkit unpack` and edited by the user.
+    directory: PathBuf,
+    /// New .wsz or .wal archive to create; it must not already exist.
+    output: PathBuf,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -223,6 +233,29 @@ fn main() -> ExitCode {
             }
             Err(error) => Err(error),
         },
+        Command::Repack(args) => {
+            match archive_export::repack_directory(&args.directory, &args.output) {
+                Ok(report) => {
+                    println!(
+                        "{}: {} entries repacked to {}",
+                        report.archive_kind,
+                        report.entries,
+                        args.output.display()
+                    );
+                    if report.legacy_unverified > 0 {
+                        eprintln!(
+                        "warning: {} v1 entries have no digest; same-size edits cannot be distinguished",
+                        report.legacy_unverified
+                    );
+                    }
+                    if let Some(warning) = report.cleanup_warning {
+                        eprintln!("warning: {warning}");
+                    }
+                    Ok(true)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Command::Render(args) => render(args),
         Command::Params => {
             print!("{}", Params::default().to_json());

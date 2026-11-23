@@ -63,6 +63,7 @@ and the original encoded path bytes are not preserved.
 walkit unpack skin.wsz unpacked-skin/
 walkit unpack skin.wal unpacked-skin/
 walkit validate unpacked-skin/
+walkit repack unpacked-skin/ rebuilt.wal
 ```
 
 `validate` compares extracted files with the manifest without changing the directory. It reports
@@ -113,6 +114,26 @@ and runtime reachability are never inferred. Source XML remains available under 
 while scripts remain opaque and are never run.
 For safety, static XML summaries are skipped with a diagnostic when nesting exceeds 128 levels
 or the archive contains over 10,000 XML elements; the original XML is still extracted.
+
+`repack` creates a new `.wsz` or `.wal` from a directory produced by `unpack`. It accepts
+manifest versions 1 and 2, includes the current bytes of every manifest-listed extracted file,
+and leaves scripts and other opaque resources unchanged unless the user edits them. Modified
+files are expected. Added files, missing files, symbolic links, unsafe paths, unextracted archive
+entries, and unsupported (`mixed` or `unknown`) archive kinds are rejected so resources are not
+silently omitted or added. Version 1 manifests lack digests, so repacking them emits a warning:
+same-size edits cannot be distinguished from the recorded source. Output names must use the
+extension matching the manifest's `archive_kind` (`.wsz` or `.wal`), and an existing destination
+is never overwritten.
+
+Entries are written in sorted path order with newly generated ZIP metadata. Original entry order,
+timestamps, compression settings, comments, and encoded path bytes are not retained. The command
+finalizes and reads back the ZIP, checks its skin kind and entries, and verifies each entry's
+bytes before installing it. Installation uses a temporary sibling and a no-overwrite hard link;
+filesystems that do not support hard links will fail safely. Repacking bounds each file to 32 MiB,
+total uncompressed contents to 256 MiB, and the output archive to 256 MiB. As with `validate`,
+use a quiescent unpacked directory: path-based traversal does not prevent a concurrent parent
+directory replacement. Structural verification does not prove rendering compatibility or runtime
+equivalence, and imported scripts are never executed.
 
 ### Many skins
 
