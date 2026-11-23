@@ -54,6 +54,7 @@ struct ManifestSnapshot {
 
 #[derive(Debug, Deserialize)]
 struct EntrySnapshot {
+    source_path: String,
     output_path: Option<String>,
     size: u64,
     resource: String,
@@ -441,6 +442,9 @@ fn validate_manifest(manifest: &ManifestSnapshot) -> Result<HashSet<String>, Str
 
     let mut expected = HashSet::new();
     let mut folded = HashSet::new();
+    let mut output_paths = Vec::new();
+    let mut has_wal_marker = false;
+    let mut has_classic_marker = false;
     for (index, entry) in manifest.entries.iter().enumerate() {
         if entry.size > MAX_ENTRY {
             return Err(format!(
@@ -455,6 +459,11 @@ fn validate_manifest(manifest: &ManifestSnapshot) -> Result<HashSet<String>, Str
                 "manifest entry {index} has an unknown resource kind"
             ));
         }
+        if entry.resource != resource_kind(&entry.source_path) {
+            return Err(format!(
+                "manifest entry {index} resource kind does not match source_path"
+            ));
+        }
         match &entry.output_path {
             Some(path) => {
                 if !entry.extracted {
@@ -465,12 +474,26 @@ fn validate_manifest(manifest: &ManifestSnapshot) -> Result<HashSet<String>, Str
                 if safe_relative_path(path).as_deref() != Some(path.as_str()) {
                     return Err(format!("manifest entry {index} has an unsafe output_path"));
                 }
+                if safe_relative_path(&entry.source_path).as_deref() != Some(path.as_str()) {
+                    return Err(format!(
+                        "manifest entry {index} source_path does not normalize to output_path"
+                    ));
+                }
                 if !folded.insert(path.to_lowercase()) {
                     return Err(format!(
                         "manifest contains duplicate or case-colliding output_path: {path:?}"
                     ));
                 }
                 expected.insert(path.clone());
+                output_paths.push(path.to_lowercase());
+                has_wal_marker |= path.eq_ignore_ascii_case("skin.xml")
+                    || path
+                        .rsplit_once('/')
+                        .is_some_and(|(_, name)| name.eq_ignore_ascii_case("skin.xml"));
+                has_classic_marker |= path.eq_ignore_ascii_case("main.bmp")
+                    || path
+                        .rsplit_once('/')
+                        .is_some_and(|(_, name)| name.eq_ignore_ascii_case("main.bmp"));
             }
             None if entry.extracted => {
                 return Err(format!(
@@ -496,11 +519,34 @@ fn validate_manifest(manifest: &ManifestSnapshot) -> Result<HashSet<String>, Str
             ));
         }
     }
+
+    output_paths.sort();
+    for pair in output_paths.windows(2) {
+        if pair[1].starts_with(&pair[0]) && pair[1].as_bytes().get(pair[0].len()) == Some(&b'/') {
+            return Err(format!(
+                "manifest output paths conflict as file and directory: {:?} and {:?}",
+                pair[0], pair[1]
+            ));
+        }
+    }
+
+    let expected_archive_kind = match (has_wal_marker, has_classic_marker) {
+        (true, false) => "wal",
+        (false, true) => "wsz",
+        (true, true) => "mixed",
+        (false, false) => "unknown",
+    };
+    if manifest.archive_kind != expected_archive_kind {
+        return Err("manifest archive_kind does not match its extracted source paths".into());
+    }
     Ok(expected)
 }
 
 fn is_sha256(text: &str) -> bool {
-    text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<String>), String> {
@@ -513,8 +559,11 @@ fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<
     while let Some((directory, depth)) = pending.pop() {
         let contents =
             fs::read_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
-        for item in contents {
-            let item = item.map_err(|e| format!("{}: {e}", directory.display()))?;
+        let mut items = contents
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}: {e}", directory.display()))?;
+        items.sort_by_key(|item| item.file_name());
+        for item in items {
             nodes += 1;
             if nodes > MAX_VALIDATION_NODES {
                 return Err("assets directory contains too many entries to validate".into());
@@ -1054,6 +1103,141 @@ mod tests {
         .unwrap();
         let error = validate_directory(&dir).unwrap_err();
         assert!(error.contains("unsafe output_path"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validation_rejects_inconsistent_manifest_provenance_and_classification() {
+        let dir = scratch("validate-provenance");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("manifest.json");
+
+        let cases = [
+            (
+                serde_json::json!({
+                    "format_version": 2,
+                    "archive_kind": "wsz",
+                    "entries": [{
+                        "output_path": "main.bmp",
+                        "size": 1,
+                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "resource": "image",
+                        "extracted": true
+                    }]
+                }),
+                "source_path",
+            ),
+            (
+                serde_json::json!({
+                    "format_version": 2,
+                    "archive_kind": "wsz",
+                    "entries": [{
+                        "source_path": "other.bmp",
+                        "output_path": "main.bmp",
+                        "size": 1,
+                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "resource": "image",
+                        "extracted": true
+                    }]
+                }),
+                "source_path does not normalize",
+            ),
+            (
+                serde_json::json!({
+                    "format_version": 2,
+                    "archive_kind": "wsz",
+                    "entries": [{
+                        "source_path": "main.bmp",
+                        "output_path": "main.bmp",
+                        "size": 1,
+                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "resource": "opaque",
+                        "extracted": true
+                    }]
+                }),
+                "resource kind does not match",
+            ),
+            (
+                serde_json::json!({
+                    "format_version": 2,
+                    "archive_kind": "wsz",
+                    "entries": [{
+                        "source_path": "main.bmp",
+                        "output_path": "main.bmp",
+                        "size": 1,
+                        "sha256": "000000000000000000000000000000000000000000000000000000000000000A",
+                        "resource": "image",
+                        "extracted": true
+                    }]
+                }),
+                "invalid SHA-256 digest",
+            ),
+        ];
+
+        for (manifest, expected_error) in cases {
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let error = validate_directory(&dir).unwrap_err();
+            assert!(
+                error.contains(expected_error),
+                "expected {expected_error:?}: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validation_rejects_conflicting_manifest_paths_and_archive_kind() {
+        let dir = scratch("validate-conflicts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("manifest.json");
+        let digest = "0000000000000000000000000000000000000000000000000000000000000000";
+        let conflicting_paths = serde_json::json!({
+            "format_version": 2,
+            "archive_kind": "unknown",
+            "entries": [
+                {"source_path":"folder", "output_path":"folder", "size":1, "sha256":digest, "resource":"opaque", "extracted":true},
+                {"source_path":"folder/file.bin", "output_path":"folder/file.bin", "size":1, "sha256":digest, "resource":"opaque", "extracted":true}
+            ]
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&conflicting_paths).unwrap(),
+        )
+        .unwrap();
+        let error = validate_directory(&dir).unwrap_err();
+        assert!(error.contains("conflict as file and directory"), "{error}");
+
+        let wrong_archive_kind = serde_json::json!({
+            "format_version": 2,
+            "archive_kind": "wal",
+            "entries": [{
+                "source_path":"main.bmp", "output_path":"main.bmp", "size":1,
+                "sha256":digest, "resource":"image", "extracted":true
+            }]
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&wrong_archive_kind).unwrap(),
+        )
+        .unwrap();
+        let error = validate_directory(&dir).unwrap_err();
+        assert!(error.contains("archive_kind does not match"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validation_orders_added_assets_independently_of_directory_iteration() {
+        let bytes = archive(&[("main.bmp", b"bitmap")]);
+        let dir = scratch("validate-order");
+        let _ = std::fs::remove_dir_all(&dir);
+        extract(&bytes, &dir).unwrap();
+        std::fs::write(dir.join("assets/z-last.bin"), b"z").unwrap();
+        std::fs::write(dir.join("assets/a-first.bin"), b"a").unwrap();
+
+        let report = validate_directory(&dir).unwrap();
+        assert_eq!(report.added, ["assets/a-first.bin", "assets/z-last.bin"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
