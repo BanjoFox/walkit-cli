@@ -1257,6 +1257,7 @@ dependencies = [
  "clap",
  "image",
  "jsonschema",
+ "libc",
  "md-5",
  "schemars",
  "serde",

@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 ureq = "3"
 md-5 = "0.10"
 sha2 = "0.10.9"
+libc = "0.2"
 schemars = "1"
 
 [profile.release]

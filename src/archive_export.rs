@@ -339,7 +339,7 @@ pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> 
         return Err("manifest.json is too large to validate".into());
     }
     let mut manifest_bytes = Vec::new();
-    File::open(&manifest_path)
+    open_validation_file(&manifest_path)
         .map_err(|e| format!("{}: {e}", manifest_path.display()))?
         .take(MAX_MANIFEST_BYTES + 1)
         .read_to_end(&mut manifest_bytes)
@@ -559,6 +559,18 @@ fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<
     let mut path_bytes = 0usize;
 
     while let Some((directory, depth)) = pending.pop() {
+        let directory_metadata = fs::symlink_metadata(&directory)
+            .map_err(|e| format!("{}: {e}", directory.display()))?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            unsafe_paths.push(format!(
+                "assets/{} (directory changed or is not a regular directory)",
+                directory
+                    .strip_prefix(assets)
+                    .unwrap_or(&directory)
+                    .display()
+            ));
+            continue;
+        }
         let contents =
             fs::read_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
         let mut items = contents
@@ -597,11 +609,16 @@ fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<
                     ObservedKind::Directory
                 }
             } else if file_type.is_file() {
-                let size = item
-                    .metadata()
-                    .map_err(|e| format!("{}: {e}", path.display()))?
-                    .len();
-                ObservedKind::File { size }
+                let metadata =
+                    fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    unsafe_paths.push(format!("assets/{key} (file changed during validation)"));
+                    ObservedKind::Other
+                } else {
+                    ObservedKind::File {
+                        size: metadata.len(),
+                    }
+                }
             } else {
                 unsafe_paths.push(format!("assets/{key} (not a regular file or directory)"));
                 ObservedKind::Other
@@ -672,7 +689,7 @@ fn unsafe_ancestor(relative: &str, observed: &HashMap<String, ObservedEntry>) ->
 }
 
 fn hash_file(path: &Path, expected_size: u64) -> Result<Option<String>, String> {
-    let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = open_validation_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(expected_size.saturating_add(1))
@@ -682,6 +699,37 @@ fn hash_file(path: &Path, expected_size: u64) -> Result<Option<String>, String> 
         return Ok(None);
     }
     Ok(Some(format!("{:x}", Sha256::digest(bytes))))
+}
+
+fn open_validation_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular non-symbolic file",
+            ));
+        }
+        File::open(path)?
+    };
+
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 fn safe_relative_path(name: &str) -> Option<String> {
@@ -1260,5 +1308,22 @@ mod tests {
         let mut total = usize::MAX;
         assert!(!add_validation_path_bytes(&mut total, 1));
         assert_eq!(total, usize::MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_file_open_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("validate-open-symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, b"data").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(open_validation_file(&link).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

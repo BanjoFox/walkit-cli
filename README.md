@@ -75,8 +75,9 @@ these checks compare files with the manifest as it exists; they do not authentic
 or prove that it is the original.
 Validation bounds manifests to 64 MiB and 100,000 entries, and bounds the walked asset tree to
 200,000 nodes and 64 MiB of aggregate path text. Static symbolic links are reported without being
-followed. Validation is not an atomic filesystem snapshot: concurrent path replacement can
-redirect path-based reads, so validate a quiescent directory. Hard links are treated as regular
+followed; on Unix, opens of the manifest and hashed files also reject a symbolic link at the final
+path component. Directory traversal remains path-based, so concurrent replacement of a parent
+directory can redirect a read. Validate a quiescent directory. Hard links are treated as regular
 files.
 
 The manifest's provisional fields are `format_version` (`2`), `archive_kind` (`wsz`, `wal`,
