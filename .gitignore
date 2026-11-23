@@ -1,5 +1,6 @@
 /target
 /out
+.scannerwork/
 *.wsz
 *.wal
 !tests/skins/*.wsz
