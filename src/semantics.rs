@@ -545,12 +545,16 @@ impl XmlScan<'_> {
                     .push(source_file.to_string());
             }
         }
-        if matches!(node.name.as_str(), "bitmap" | "truetypefont" | "script") {
+        if matches!(
+            node.name.as_str(),
+            "bitmap" | "bitmapfont" | "truetypefont" | "script"
+        ) {
             if let Some(path) = node.get("file") {
-                let runtime_generated = path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("$solid"));
+                let runtime_generated = node.name == "bitmap"
+                    && path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("$solid"));
                 self.file_references.push(XmlFileReference {
                     source_file: source_file.to_string(),
                     tag: node.name.clone(),
@@ -719,10 +723,11 @@ mod tests {
             ),
             (
                 "parts/ui.xml",
-                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><script id="loader" file="scripts/loader.maki"/></elements>"#[..]),
+                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><bitmap id="escaped-generated" file="dir\$solid"/><bitmapfont id="fontgrid" file="fonts/grid.bmp"/><bitmapfont id="fontmissing" file="fonts/missing.bmp"/><bitmapfont id="fontliteral" file="$solid"/><script id="loader" file="scripts/loader.maki"/></elements>"#[..]),
             ),
             ("img/logo.png", Rc::from(&b"logo"[..])),
             ("img/alternate.png", Rc::from(&b"alternate"[..])),
+            ("fonts/grid.bmp", Rc::from(&b"glyph sheet"[..])),
             ("scripts/loader.maki", Rc::from(&b"opaque script"[..])),
         ];
         let semantics = inspect("wal", entries);
@@ -752,6 +757,18 @@ mod tests {
         assert_eq!(present("img/alternate.png"), Some(true));
         assert_eq!(present("img/missing.png"), Some(false));
         assert_eq!(present("$solid"), None);
+        assert_eq!(present("dir\\$solid"), Some(false));
+        assert_eq!(present("fonts/grid.bmp"), Some(true));
+        assert_eq!(present("fonts/missing.bmp"), Some(false));
+        assert_eq!(
+            modern
+                .file_references
+                .iter()
+                .find(|reference| reference.tag == "bitmapfont" && reference.path == "$solid")
+                .unwrap()
+                .archive_file_present,
+            Some(false)
+        );
         assert_eq!(present("scripts/loader.maki"), Some(true));
         assert_eq!(modern.xml_include_references.len(), 2);
         assert!(modern.xml_include_references[0].root_entry_present);
