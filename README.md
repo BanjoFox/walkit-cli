@@ -73,6 +73,11 @@ only be compared by size, so same-size edits are reported as unverified. Version
 SHA-256 digest for each source file and detects same-size edits. The manifest is not signed, so
 these checks compare files with the manifest as it exists; they do not authenticate the manifest
 or prove that it is the original.
+Validation bounds manifests to 64 MiB and 100,000 entries, and bounds the walked asset tree to
+200,000 nodes and 64 MiB of aggregate path text. Static symbolic links are reported without being
+followed. Validation is not an atomic filesystem snapshot: concurrent path replacement can
+redirect path-based reads, so validate a quiescent directory. Hard links are treated as regular
+files.
 
 The manifest's provisional fields are `format_version` (`2`), `archive_kind` (`wsz`, `wal`,
 `mixed`, or `unknown`), and `entries`. Each entry has the decoded `source_path`, nullable

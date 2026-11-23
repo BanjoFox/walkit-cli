@@ -21,6 +21,7 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VALIDATION_NODES: usize = MAX_ENTRIES * 2;
 const MAX_VALIDATION_DEPTH: usize = 2048;
+const MAX_VALIDATION_PATH_BYTES: usize = MAX_MANIFEST_BYTES as usize;
 
 #[derive(Debug, Serialize)]
 pub struct Manifest {
@@ -555,6 +556,7 @@ fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<
     let mut unsafe_paths = Vec::new();
     let mut pending = vec![(assets.to_path_buf(), 0usize)];
     let mut nodes = 0usize;
+    let mut path_bytes = 0usize;
 
     while let Some((directory, depth)) = pending.pop() {
         let contents =
@@ -575,6 +577,9 @@ fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<
             let relative = path
                 .strip_prefix(assets)
                 .map_err(|_| "assets entry escaped its directory".to_string())?;
+            if !add_validation_path_bytes(&mut path_bytes, relative.to_string_lossy().len()) {
+                return Err("assets directory has too much path data to validate".into());
+            }
             let Some(key) = asset_key(relative) else {
                 unsafe_paths.push(format!("assets/{relative:?} (unsafe or non-UTF-8 path)"));
                 continue;
@@ -636,6 +641,11 @@ fn asset_key(relative: &Path) -> Option<String> {
     }
     let key = parts.join("/");
     (safe_relative_path(&key).as_deref() == Some(key.as_str())).then_some(key)
+}
+
+fn add_validation_path_bytes(total: &mut usize, bytes: usize) -> bool {
+    *total = total.saturating_add(bytes);
+    *total <= MAX_VALIDATION_PATH_BYTES
 }
 
 fn unsafe_ancestor(relative: &str, observed: &HashMap<String, ObservedEntry>) -> Option<String> {
@@ -1239,5 +1249,16 @@ mod tests {
         let report = validate_directory(&dir).unwrap();
         assert_eq!(report.added, ["assets/a-first.bin", "assets/z-last.bin"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validation_path_budget_is_bounded() {
+        let mut total = MAX_VALIDATION_PATH_BYTES - 1;
+        assert!(add_validation_path_bytes(&mut total, 1));
+        assert!(!add_validation_path_bytes(&mut total, 1));
+
+        let mut total = usize::MAX;
+        assert!(!add_validation_path_bytes(&mut total, 1));
+        assert_eq!(total, usize::MAX);
     }
 }
