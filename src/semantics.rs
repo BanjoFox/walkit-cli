@@ -715,6 +715,22 @@ mod tests {
     }
 
     #[test]
+    fn nested_container_and_element_trees_keep_their_source_parentage() {
+        let entries = [(
+            "skin.xml",
+            Rc::from(&br#"<WasabiXML><container id="outer"><container id="inner"><layout id="nested" w="80" h="40"><group id="group"><button id="child" image="asset"/></group></layout></container></container></WasabiXML>"#[..]),
+        )];
+        let semantics = inspect("wal", entries);
+        let modern = semantics.modern.unwrap();
+        assert_eq!(modern.layouts.len(), 1);
+        assert_eq!(modern.layouts[0].container_id.as_deref(), Some("inner"));
+        assert_eq!(modern.layouts[0].elements[0].tag, "group");
+        assert_eq!(modern.layouts[0].elements[0].children[0].tag, "button");
+        assert_eq!(modern.bitmap_references[0].target, "asset");
+        assert_eq!(modern.bitmap_references[0].source_file, "skin.xml");
+    }
+
+    #[test]
     fn source_documents_expose_raw_includes_definitions_and_file_presence() {
         let entries = [
             (
@@ -723,7 +739,11 @@ mod tests {
             ),
             (
                 "parts/ui.xml",
-                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><bitmap id="escaped-generated" file="dir\$solid"/><bitmapfont id="fontgrid" file="fonts/grid.bmp"/><bitmapfont id="fontmissing" file="fonts/missing.bmp"/><bitmapfont id="fontliteral" file="$solid"/><script id="loader" file="scripts/loader.maki"/></elements>"#[..]),
+                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><bitmap id="escaped-generated" file="dir\$solid"/><bitmapfont id="fontgrid" file="fonts/grid.bmp"/><bitmapfont id="fontmissing" file="fonts/missing.bmp"/><bitmapfont id="fontliteral" file="$solid"/><script id="loader" file="scripts/loader.maki"/><include file="deep/panel.xml"/></elements>"#[..]),
+            ),
+            (
+                "parts/deep/panel.xml",
+                Rc::from(&br#"<elements><color id="panel" value="1,2,3"/></elements>"#[..]),
             ),
             ("img/logo.png", Rc::from(&b"logo"[..])),
             ("img/alternate.png", Rc::from(&b"alternate"[..])),
@@ -732,13 +752,23 @@ mod tests {
         ];
         let semantics = inspect("wal", entries);
         let modern = semantics.modern.unwrap();
-        assert_eq!(modern.xml_documents.len(), 2);
-        assert_eq!(modern.xml_documents[0].source_file, "parts/ui.xml");
+        assert_eq!(modern.xml_documents.len(), 3);
+        let document = |source_file: &str| {
+            modern
+                .xml_documents
+                .iter()
+                .find(|document| document.source_file == source_file)
+                .unwrap()
+        };
         assert_eq!(
-            modern.xml_documents[1].includes,
+            document("skin.xml").includes,
             ["parts/ui.xml", "missing.xml"]
         );
-        assert_eq!(modern.xml_documents[1].definitions[0].tag, "bitmap");
+        assert_eq!(document("parts/ui.xml").includes, ["deep/panel.xml"]);
+        assert!(document("parts/ui.xml")
+            .definitions
+            .iter()
+            .any(|definition| definition.tag == "bitmap"));
         assert_eq!(modern.duplicate_declarations.len(), 2);
         assert_eq!(modern.duplicate_declarations[0].tag, "bitmap");
         assert_eq!(modern.duplicate_declarations[0].id, "logo");
@@ -770,9 +800,21 @@ mod tests {
             Some(false)
         );
         assert_eq!(present("scripts/loader.maki"), Some(true));
-        assert_eq!(modern.xml_include_references.len(), 2);
-        assert!(modern.xml_include_references[0].root_entry_present);
-        assert!(!modern.xml_include_references[1].root_entry_present);
+        assert_eq!(modern.xml_include_references.len(), 3);
+        let root_include = |source_file: &str, target: &str| {
+            modern
+                .xml_include_references
+                .iter()
+                .find(|reference| {
+                    reference.source_file == source_file && reference.target == target
+                })
+                .unwrap()
+                .root_entry_present
+        };
+        assert!(root_include("skin.xml", "parts/ui.xml"));
+        assert!(!root_include("skin.xml", "missing.xml"));
+        // Runtime-relative existence is deliberately outside this root-only observation.
+        assert!(!root_include("parts/ui.xml", "deep/panel.xml"));
         let bitmap_ref = |target: &str| {
             modern
                 .bitmap_references
