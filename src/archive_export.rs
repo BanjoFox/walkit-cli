@@ -1137,6 +1137,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validation_reports_dangling_symlinks_as_unsafe() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = archive(&[("main.bmp", b"bitmap")]);
+        let dir = scratch("validate-dangling-symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        extract(&bytes, &dir).unwrap();
+        let asset = dir.join("assets/main.bmp");
+        std::fs::remove_file(&asset).unwrap();
+        symlink(dir.join("absent-target.bmp"), &asset).unwrap();
+
+        let report = validate_directory(&dir).unwrap();
+        assert_eq!(report.unchanged, 0);
+        assert!(report
+            .unsafe_paths
+            .iter()
+            .any(|path| path.contains("assets/main.bmp") && path.contains("symbolic link")));
+        assert!(report.missing.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn validation_rejects_traversal_in_the_manifest() {
         let dir = scratch("validate-traversal");
