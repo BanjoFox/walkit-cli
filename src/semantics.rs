@@ -419,7 +419,7 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
                 include_references: &mut include_references,
             };
             for root in walkit::xml::parse(&text) {
-                scan.node(&root, &source_file, None);
+                scan.node(&root, &source_file, None, false);
             }
         }
         documents.push(XmlDocumentMetadata {
@@ -514,6 +514,7 @@ impl XmlScan<'_> {
         node: &walkit::xml::XmlNode,
         source_file: &str,
         parent_container: Option<&str>,
+        inside_layout: bool,
     ) {
         let container = if node.name == "container" {
             node.get("id").or(parent_container)
@@ -592,7 +593,7 @@ impl XmlScan<'_> {
                 ));
             }
         }
-        if node.name == "layout" {
+        if node.name == "layout" && !inside_layout {
             self.layouts.push(LayoutMetadata {
                 source_file: source_file.to_string(),
                 container_id: container.map(str::to_string),
@@ -615,7 +616,12 @@ impl XmlScan<'_> {
             });
         }
         for child in &node.children {
-            self.node(child, source_file, container);
+            self.node(
+                child,
+                source_file,
+                container,
+                inside_layout || node.name == "layout",
+            );
         }
     }
 }
@@ -731,6 +737,21 @@ mod tests {
         assert_eq!(modern.layouts[0].elements[0].children[0].tag, "button");
         assert_eq!(modern.bitmap_references[0].target, "asset");
         assert_eq!(modern.bitmap_references[0].source_file, "skin.xml");
+    }
+
+    #[test]
+    fn nested_layout_elements_remain_in_the_parent_layout_tree() {
+        let entries = [(
+            "skin.xml",
+            Rc::from(&br#"<WasabiXML><container id="main"><layout id="normal"><group id="group"><layout id="embedded"><button id="child" image="nested-image"/></layout></group></layout></container></WasabiXML>"#[..]),
+        )];
+        let semantics = inspect("wal", entries);
+        let modern = semantics.modern.unwrap();
+        assert_eq!(modern.layouts.len(), 1);
+        assert_eq!(modern.layouts[0].id.as_deref(), Some("normal"));
+        assert_eq!(modern.layouts[0].elements[0].children[0].tag, "layout");
+        assert_eq!(modern.bitmap_references.len(), 1);
+        assert_eq!(modern.bitmap_references[0].target, "nested-image");
     }
 
     #[test]
