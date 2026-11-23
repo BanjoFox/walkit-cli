@@ -66,10 +66,13 @@ walkit validate unpacked-skin/
 ```
 
 `validate` compares extracted files with the manifest without changing the directory. It reports
-modified, missing, added, and unsafe paths. It exits 0 when every extracted file matches, 1 when
-the directory differs or a legacy entry cannot be fully checked, and 2 for an invalid directory
-or manifest. Version 1 manifests are still read, but have no per-file hashes: those entries can
-only be compared by size, so same-size edits are reported as unverified. Version 2 records a
+modified, missing, added, and unsafe paths, including archive entries that `unpack` did not
+extract because their source path was unsafe or the entry was a symbolic link. The provisional
+manifest does not distinguish those two reasons. It exits 0 when every extracted file matches, 1
+when the directory differs, an archive entry was not extracted, or a legacy entry cannot be fully
+checked, and 2 for an invalid directory or manifest. Version 1 manifests are still read, but have
+no per-file hashes: those entries can only be compared by size, so same-size edits are reported
+as unverified. Version 2 records a
 SHA-256 digest for each source file and detects same-size edits. The manifest is not signed, so
 these checks compare files with the manifest as it exists; they do not authenticate the manifest
 or prove that it is the original.

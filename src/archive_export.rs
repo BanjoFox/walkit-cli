@@ -367,6 +367,12 @@ pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> 
 
     for entry in &manifest.entries {
         let Some(relative) = &entry.output_path else {
+            if !entry.extracted {
+                report.unsafe_paths.push(format!(
+                    "archive entry {:?} was not extracted (unsafe path or symbolic link)",
+                    entry.source_path
+                ));
+            }
             continue;
         };
         let display = format!("assets/{relative}");
@@ -1003,6 +1009,9 @@ mod tests {
             std::fs::read(dir.join("assets/safe/file.txt")).unwrap(),
             b"inside"
         );
+        let report = validate_directory(&dir).unwrap();
+        assert_eq!(report.unsafe_paths.len(), 6);
+        assert!(!report.is_clean());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1031,10 +1040,19 @@ mod tests {
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-        let manifest = inventory(&writer.finish().unwrap().into_inner()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let manifest = inventory(&bytes).unwrap();
         assert_eq!(manifest.archive_kind, "unknown");
         assert_eq!(manifest.entries[0].output_path, None);
         assert!(!manifest.entries[0].extracted);
+
+        let dir = scratch("symlink-entry");
+        let _ = std::fs::remove_dir_all(&dir);
+        extract(&bytes, &dir).unwrap();
+        let report = validate_directory(&dir).unwrap();
+        assert_eq!(report.unsafe_paths.len(), 1);
+        assert!(!report.is_clean());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

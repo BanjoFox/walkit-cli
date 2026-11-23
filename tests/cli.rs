@@ -180,6 +180,49 @@ fn unpacked_directory_can_be_validated_from_the_cli() {
 }
 
 #[test]
+fn validation_reports_archive_entries_that_unpack_skipped() {
+    let dir = Scratch::new("unextracted-entry");
+    let archive_path = dir.path("unsafe.wsz");
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, bytes) in [
+        ("main.bmp", b"bitmap".as_slice()),
+        ("../outside.txt", b"unsafe"),
+    ] {
+        archive
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    std::fs::write(&archive_path, archive.finish().unwrap().into_inner()).unwrap();
+
+    let unpacked = dir.path("unpacked");
+    let unpack = run(&[
+        "unpack",
+        archive_path.to_str().unwrap(),
+        unpacked.to_str().unwrap(),
+    ]);
+    assert!(unpack.status.success(), "{}", text(&unpack.stderr));
+    assert!(text(&unpack.stdout).contains("2 entries inventoried, 1 extracted"));
+    assert!(!dir.path("outside.txt").exists());
+
+    let validate = run(&["validate", unpacked.to_str().unwrap()]);
+    assert_eq!(
+        validate.status.code(),
+        Some(1),
+        "{}",
+        text(&validate.stderr)
+    );
+    assert!(
+        text(&validate.stdout).contains(
+            "unsafe: archive entry \"../outside.txt\" was not extracted (unsafe path or symbolic link)"
+        ),
+        "{}",
+        text(&validate.stdout)
+    );
+    assert!(text(&validate.stdout).contains("1 unsafe"));
+}
+
+#[test]
 fn a_fonts_folder_replaces_the_stand_ins() {
     let dir = Scratch::new("fonts");
     let fonts = dir.path("fonts");
