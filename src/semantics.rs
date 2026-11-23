@@ -497,6 +497,38 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
 type RawBitmapReference = (String, String, Option<String>, String, String);
 type RawXmlIncludeReference = (String, String);
 
+fn is_bitmap_reference_attribute(tag: &str, attribute: &str) -> bool {
+    match tag {
+        "button" | "wasabi:button" | "nstatesbutton" | "togglebutton" => matches!(
+            attribute,
+            "image" | "downimage" | "hoverimage" | "activeimage"
+        ),
+        "layer" | "animatedlayer" => matches!(attribute, "image" | "inactiveimage"),
+        "slider" | "wasabi:hslider" | "wasabi:vslider" => matches!(
+            attribute,
+            "thumb" | "downthumb" | "barleft" | "barmiddle" | "barright"
+        ),
+        "status" => matches!(attribute, "stopbitmap" | "playbitmap" | "pausebitmap"),
+        "grid" | "progressgrid" => matches!(
+            attribute,
+            "topleft"
+                | "top"
+                | "topright"
+                | "left"
+                | "middle"
+                | "right"
+                | "bottomleft"
+                | "bottom"
+                | "bottomright"
+        ),
+        "images" => attribute == "images",
+        "container" | "layout" | "group" | "component" | "windowholder" => {
+            attribute == "background"
+        }
+        _ => false,
+    }
+}
+
 struct XmlScan<'a> {
     files: &'a MemoryFiles,
     layouts: &'a mut Vec<LayoutMetadata>,
@@ -568,22 +600,8 @@ impl XmlScan<'_> {
                 });
             }
         }
-        const BITMAP_ATTRIBUTES: [&str; 12] = [
-            "image",
-            "downimage",
-            "hoverimage",
-            "activeimage",
-            "inactiveimage",
-            "thumb",
-            "downthumb",
-            "barleft",
-            "barmiddle",
-            "barright",
-            "background",
-            "images",
-        ];
         for (attribute, target) in &node.attrs {
-            if BITMAP_ATTRIBUTES.contains(&attribute.as_str()) {
+            if is_bitmap_reference_attribute(&node.name, attribute) {
                 self.bitmap_references.push((
                     source_file.to_string(),
                     node.name.clone(),
@@ -777,6 +795,37 @@ mod tests {
         );
         assert_eq!(modern.bitmap_references[0].target, "");
         assert!(!modern.bitmap_references[0].archive_file_present);
+    }
+
+    #[test]
+    fn bitmap_references_use_walkits_tag_specific_attribute_contracts() {
+        let entries = [(
+            "skin.xml",
+            Rc::from(&br#"<WasabiXML><skininfo image="metadata-image" background="metadata-background"/><container id="main" background="window-bg"><layout id="normal" background="layout-bg"><button id="button" image="button-image"/><animatedlayer id="animation" inactiveimage="inactive-image"/><slider id="slider" thumb="thumb-image"/><status id="status" stopbitmap="stop-image"/><grid id="grid" topleft="grid-image"/><images id="images" images="strip-image"/></layout></container></WasabiXML>"#[..]),
+        )];
+        let semantics = inspect("wal", entries);
+        let modern = semantics.modern.unwrap();
+        let refs: Vec<_> = modern
+            .bitmap_references
+            .iter()
+            .map(|reference| (reference.element_tag.as_str(), reference.attribute.as_str()))
+            .collect();
+        for expected in [
+            ("container", "background"),
+            ("layout", "background"),
+            ("button", "image"),
+            ("animatedlayer", "inactiveimage"),
+            ("slider", "thumb"),
+            ("status", "stopbitmap"),
+            ("grid", "topleft"),
+            ("images", "images"),
+        ] {
+            assert!(refs.contains(&expected), "missing {expected:?} in {refs:?}");
+        }
+        assert!(modern
+            .bitmap_references
+            .iter()
+            .all(|reference| !reference.target.starts_with("metadata-")));
     }
 
     #[test]
