@@ -5,18 +5,22 @@
 //! Entries are never interpreted or executed. Unsafe paths and symbolic links are reported
 //! in the manifest but are not extracted.
 
-use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MAX_ENTRY: u64 = 32 * 1024 * 1024;
 const MAX_TOTAL: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_VALIDATION_NODES: usize = MAX_ENTRIES * 2;
+const MAX_VALIDATION_DEPTH: usize = 2048;
 
 #[derive(Debug, Serialize)]
 pub struct Manifest {
@@ -32,11 +36,66 @@ pub struct Entry {
     /// Relative path below `assets/`; absent when the source path is unsafe.
     pub output_path: Option<String>,
     pub size: u64,
+    /// SHA-256 of the source entry bytes, for comparison with an unpacked asset.
+    pub sha256: String,
     /// Extension-level classification only. `opaque` resources remain preserved as bytes.
     pub resource: &'static str,
     pub extracted: bool,
     #[serde(skip)]
     bytes: Rc<[u8]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestSnapshot {
+    format_version: u32,
+    archive_kind: String,
+    entries: Vec<EntrySnapshot>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntrySnapshot {
+    output_path: Option<String>,
+    size: u64,
+    resource: String,
+    extracted: bool,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ValidationReport {
+    pub unchanged: usize,
+    pub modified: Vec<String>,
+    pub missing: Vec<String>,
+    pub added: Vec<String>,
+    pub unsafe_paths: Vec<String>,
+    /// V1 entries whose size matches but have no hash to verify their contents.
+    pub legacy_unverified: usize,
+}
+
+impl ValidationReport {
+    pub fn is_clean(&self) -> bool {
+        self.modified.is_empty()
+            && self.missing.is_empty()
+            && self.added.is_empty()
+            && self.unsafe_paths.is_empty()
+            && self.legacy_unverified == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObservedKind {
+    File { size: u64 },
+    Directory,
+    Symlink,
+    Other,
+    CaseCollision,
+}
+
+#[derive(Debug)]
+struct ObservedEntry {
+    path: PathBuf,
+    kind: ObservedKind,
 }
 
 /// Reads and bounds a local archive before allocating its contents.
@@ -115,6 +174,7 @@ pub fn inventory(bytes: &[u8]) -> Result<Manifest, String> {
             source_path: source_path.clone(),
             output_path,
             size,
+            sha256: format!("{:x}", Sha256::digest(&content)),
             resource: resource_kind(&source_path),
             extracted: false,
             bytes: content.into(),
@@ -139,7 +199,7 @@ pub fn inventory(bytes: &[u8]) -> Result<Manifest, String> {
         (false, false) => "unknown",
     };
     Ok(Manifest {
-        format_version: 1,
+        format_version: 2,
         archive_kind,
         entries,
     })
@@ -199,7 +259,7 @@ pub fn extract(bytes: &[u8], destination: &Path) -> Result<Manifest, String> {
             .map_err(|e| format!("{}: {e}", semantics_path.display()))?;
 
         let path = destination.join("manifest.json");
-        let json = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+        let json = manifest_json(&manifest)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -217,6 +277,352 @@ pub fn extract(bytes: &[u8], destination: &Path) -> Result<Manifest, String> {
         };
     }
     Ok(manifest)
+}
+
+struct LimitedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for LimitedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("manifest size limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn manifest_json(manifest: &Manifest) -> Result<Vec<u8>, String> {
+    let mut writer = LimitedWriter {
+        bytes: Vec::new(),
+        limit: MAX_MANIFEST_BYTES as usize,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer_pretty(&mut writer, manifest) {
+        if writer.exceeded {
+            return Err("the manifest is too large to validate".into());
+        }
+        return Err(error.to_string());
+    }
+    Ok(writer.bytes)
+}
+
+/// Compare an unpacked directory with its manifest without modifying the directory.
+/// Version 1 manifests can only detect size changes; version 2 also checks SHA-256.
+pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> {
+    let root_metadata =
+        fs::symlink_metadata(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!("not a regular directory: {}", directory.display()));
+    }
+
+    let manifest_path = directory.join("manifest.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err(format!(
+            "manifest is not a regular file: {}",
+            manifest_path.display()
+        ));
+    }
+    if manifest_metadata.len() > MAX_MANIFEST_BYTES {
+        return Err("manifest.json is too large to validate".into());
+    }
+    let mut manifest_bytes = Vec::new();
+    File::open(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("manifest.json is too large to validate".into());
+    }
+    let manifest: ManifestSnapshot = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("{}: invalid manifest: {e}", manifest_path.display()))?;
+    let expected = validate_manifest(&manifest)?;
+
+    let assets = directory.join("assets");
+    let assets_metadata =
+        fs::symlink_metadata(&assets).map_err(|e| format!("{}: {e}", assets.display()))?;
+    if assets_metadata.file_type().is_symlink() || !assets_metadata.is_dir() {
+        return Err(format!(
+            "assets is not a regular directory: {}",
+            assets.display()
+        ));
+    }
+
+    let mut report = ValidationReport::default();
+    let (observed, mut unsafe_paths) = observe_assets(&assets)?;
+    report.unsafe_paths.append(&mut unsafe_paths);
+
+    for entry in &manifest.entries {
+        let Some(relative) = &entry.output_path else {
+            continue;
+        };
+        let display = format!("assets/{relative}");
+        if let Some(ancestor) = unsafe_ancestor(relative, &observed) {
+            report
+                .unsafe_paths
+                .push(format!("assets/{ancestor} (unsafe parent of {relative})"));
+            continue;
+        }
+        match observed.get(relative).map(|entry| &entry.kind) {
+            None => report.missing.push(display),
+            Some(ObservedKind::Directory) => report.unsafe_paths.push(format!(
+                "{display} (expected a regular file, found a directory)"
+            )),
+            Some(ObservedKind::Symlink) => report
+                .unsafe_paths
+                .push(format!("{display} (symbolic link)")),
+            Some(ObservedKind::Other | ObservedKind::CaseCollision) => report
+                .unsafe_paths
+                .push(format!("{display} (not a unique regular file)")),
+            Some(ObservedKind::File { size }) if *size != entry.size => {
+                report.modified.push(display)
+            }
+            Some(ObservedKind::File { .. }) => match &entry.sha256 {
+                Some(expected_hash) => {
+                    let path = &observed[relative].path;
+                    let Some(actual_hash) = hash_file(path, entry.size)? else {
+                        report.modified.push(display);
+                        continue;
+                    };
+                    if &actual_hash == expected_hash {
+                        report.unchanged += 1;
+                    } else {
+                        report.modified.push(display);
+                    }
+                }
+                None => report.legacy_unverified += 1,
+            },
+        }
+    }
+
+    for (relative, entry) in &observed {
+        if expected.contains(relative) {
+            continue;
+        }
+        if matches!(entry.kind, ObservedKind::File { .. }) {
+            report.added.push(format!("assets/{relative}"));
+        }
+    }
+    report.modified.sort();
+    report.missing.sort();
+    report.added.sort();
+    report.unsafe_paths.sort();
+    report.unsafe_paths.dedup();
+    Ok(report)
+}
+
+fn validate_manifest(manifest: &ManifestSnapshot) -> Result<HashSet<String>, String> {
+    if !matches!(manifest.format_version, 1 | 2) {
+        return Err(format!(
+            "unsupported manifest format_version: {}",
+            manifest.format_version
+        ));
+    }
+    if !matches!(
+        manifest.archive_kind.as_str(),
+        "wsz" | "wal" | "mixed" | "unknown"
+    ) {
+        return Err("manifest has an unknown archive_kind".into());
+    }
+    if manifest.entries.len() > MAX_ENTRIES {
+        return Err("manifest has too many entries".into());
+    }
+
+    let mut expected = HashSet::new();
+    let mut folded = HashSet::new();
+    for (index, entry) in manifest.entries.iter().enumerate() {
+        if entry.size > MAX_ENTRY {
+            return Err(format!(
+                "manifest entry {index} exceeds the file size limit"
+            ));
+        }
+        if !matches!(
+            entry.resource.as_str(),
+            "image" | "audio" | "font" | "text_or_archive" | "opaque"
+        ) {
+            return Err(format!(
+                "manifest entry {index} has an unknown resource kind"
+            ));
+        }
+        match &entry.output_path {
+            Some(path) => {
+                if !entry.extracted {
+                    return Err(format!(
+                        "manifest entry {index} has an output_path but is not extracted"
+                    ));
+                }
+                if safe_relative_path(path).as_deref() != Some(path.as_str()) {
+                    return Err(format!("manifest entry {index} has an unsafe output_path"));
+                }
+                if !folded.insert(path.to_lowercase()) {
+                    return Err(format!(
+                        "manifest contains duplicate or case-colliding output_path: {path:?}"
+                    ));
+                }
+                expected.insert(path.clone());
+            }
+            None if entry.extracted => {
+                return Err(format!(
+                    "manifest entry {index} is extracted without an output_path"
+                ));
+            }
+            None => {}
+        }
+
+        if manifest.format_version == 2 {
+            let hash = entry
+                .sha256
+                .as_deref()
+                .ok_or_else(|| format!("manifest entry {index} is missing its SHA-256 digest"))?;
+            if !is_sha256(hash) {
+                return Err(format!(
+                    "manifest entry {index} has an invalid SHA-256 digest"
+                ));
+            }
+        } else if entry.sha256.as_deref().is_some_and(|hash| !is_sha256(hash)) {
+            return Err(format!(
+                "manifest entry {index} has an invalid SHA-256 digest"
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+fn is_sha256(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn observe_assets(assets: &Path) -> Result<(HashMap<String, ObservedEntry>, Vec<String>), String> {
+    let mut observed = HashMap::<String, ObservedEntry>::new();
+    let mut folded = HashMap::<String, String>::new();
+    let mut unsafe_paths = Vec::new();
+    let mut pending = vec![(assets.to_path_buf(), 0usize)];
+    let mut nodes = 0usize;
+
+    while let Some((directory, depth)) = pending.pop() {
+        let contents =
+            fs::read_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+        for item in contents {
+            let item = item.map_err(|e| format!("{}: {e}", directory.display()))?;
+            nodes += 1;
+            if nodes > MAX_VALIDATION_NODES {
+                return Err("assets directory contains too many entries to validate".into());
+            }
+            let path = item.path();
+            let file_type = item
+                .file_type()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let relative = path
+                .strip_prefix(assets)
+                .map_err(|_| "assets entry escaped its directory".to_string())?;
+            let Some(key) = asset_key(relative) else {
+                unsafe_paths.push(format!("assets/{relative:?} (unsafe or non-UTF-8 path)"));
+                continue;
+            };
+
+            let kind = if file_type.is_symlink() {
+                unsafe_paths.push(format!("assets/{key} (symbolic link)"));
+                ObservedKind::Symlink
+            } else if file_type.is_dir() {
+                if depth >= MAX_VALIDATION_DEPTH {
+                    unsafe_paths.push(format!("assets/{key} (directory nesting limit exceeded)"));
+                    ObservedKind::Other
+                } else {
+                    pending.push((path.clone(), depth + 1));
+                    ObservedKind::Directory
+                }
+            } else if file_type.is_file() {
+                let size = item
+                    .metadata()
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                    .len();
+                ObservedKind::File { size }
+            } else {
+                unsafe_paths.push(format!("assets/{key} (not a regular file or directory)"));
+                ObservedKind::Other
+            };
+
+            let folded_key = key.to_lowercase();
+            if let Some(previous) = folded.get(&folded_key) {
+                unsafe_paths.push(format!(
+                    "assets/{previous} and assets/{key} (case-colliding paths)"
+                ));
+                if let Some(previous_entry) = observed.get_mut(previous) {
+                    previous_entry.kind = ObservedKind::CaseCollision;
+                }
+                observed.insert(
+                    key,
+                    ObservedEntry {
+                        path,
+                        kind: ObservedKind::CaseCollision,
+                    },
+                );
+            } else {
+                folded.insert(folded_key, key.clone());
+                observed.insert(key, ObservedEntry { path, kind });
+            }
+        }
+    }
+    Ok((observed, unsafe_paths))
+}
+
+fn asset_key(relative: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        parts.push(part.to_str()?);
+    }
+    let key = parts.join("/");
+    (safe_relative_path(&key).as_deref() == Some(key.as_str())).then_some(key)
+}
+
+fn unsafe_ancestor(relative: &str, observed: &HashMap<String, ObservedEntry>) -> Option<String> {
+    let mut prefix = String::new();
+    let parts: Vec<_> = relative.split('/').collect();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if observed.get(&prefix).is_some_and(|entry| {
+            matches!(
+                entry.kind,
+                ObservedKind::File { .. }
+                    | ObservedKind::Symlink
+                    | ObservedKind::Other
+                    | ObservedKind::CaseCollision
+            )
+        }) {
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+fn hash_file(path: &Path, expected_size: u64) -> Result<Option<String>, String> {
+    let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(expected_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 != expected_size {
+        return Ok(None);
+    }
+    Ok(Some(format!("{:x}", Sha256::digest(bytes))))
 }
 
 fn safe_relative_path(name: &str) -> Option<String> {
@@ -329,7 +735,7 @@ mod tests {
         assert!(opaque.extracted);
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["format_version"], 2);
         assert_eq!(json["entries"][0]["size"], 6);
         let semantics: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("semantics.json")).unwrap()).unwrap();
@@ -544,5 +950,110 @@ mod tests {
             .archive_kind,
             "unknown"
         );
+    }
+
+    #[test]
+    fn validation_detects_same_size_edits_missing_files_and_additions() {
+        let bytes = archive(&[("main.bmp", b"original"), ("notes.txt", b"keep")]);
+        let dir = scratch("validate-edits");
+        let _ = std::fs::remove_dir_all(&dir);
+        extract(&bytes, &dir).unwrap();
+
+        let clean = validate_directory(&dir).unwrap();
+        assert!(clean.is_clean());
+        assert_eq!(clean.unchanged, 2);
+
+        std::fs::write(dir.join("assets/main.bmp"), b"edited!!").unwrap();
+        std::fs::remove_file(dir.join("assets/notes.txt")).unwrap();
+        std::fs::write(dir.join("assets/new-image.bmp"), b"new").unwrap();
+
+        let report = validate_directory(&dir).unwrap();
+        assert_eq!(report.modified, ["assets/main.bmp"]);
+        assert_eq!(report.missing, ["assets/notes.txt"]);
+        assert_eq!(report.added, ["assets/new-image.bmp"]);
+        assert!(!report.is_clean());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_v1_validation_does_not_claim_same_size_files_are_unchanged() {
+        let dir = scratch("validate-v1");
+        let assets = dir.join("assets");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("main.bmp"), b"edited!").unwrap();
+        let manifest = serde_json::json!({
+            "format_version": 1,
+            "archive_kind": "wsz",
+            "entries": [{
+                "source_path": "main.bmp",
+                "output_path": "main.bmp",
+                "size": 7,
+                "resource": "image",
+                "extracted": true
+            }]
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let report = validate_directory(&dir).unwrap();
+        assert_eq!(report.legacy_unverified, 1);
+        assert_eq!(report.unchanged, 0);
+        assert!(!report.is_clean());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_reports_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = archive(&[("main.bmp", b"bitmap")]);
+        let dir = scratch("validate-symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        extract(&bytes, &dir).unwrap();
+        let asset = dir.join("assets/main.bmp");
+        std::fs::remove_file(&asset).unwrap();
+        let outside = dir.join("outside.bmp");
+        std::fs::write(&outside, b"bitmap").unwrap();
+        symlink(&outside, &asset).unwrap();
+
+        let report = validate_directory(&dir).unwrap();
+        assert!(report
+            .unsafe_paths
+            .iter()
+            .any(|path| path.contains("assets/main.bmp") && path.contains("symbolic link")));
+        assert_eq!(report.unchanged, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validation_rejects_traversal_in_the_manifest() {
+        let dir = scratch("validate-traversal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "format_version": 2,
+            "archive_kind": "wsz",
+            "entries": [{
+                "source_path": "../outside.bmp",
+                "output_path": "../outside.bmp",
+                "size": 1,
+                "sha256": "2d711642b726b04401627ca9fbac32f5da7e5f7f5b7f7f2d4d9d6b7f3f7f3f7f",
+                "resource": "image",
+                "extracted": true
+            }]
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = validate_directory(&dir).unwrap_err();
+        assert!(error.contains("unsafe output_path"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

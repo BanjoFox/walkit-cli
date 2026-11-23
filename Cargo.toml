@@ -35,6 +35,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }
 ureq = "3"
 md-5 = "0.10"
+sha2 = "0.10.9"
 schemars = "1"
 
 [profile.release]

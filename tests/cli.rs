@@ -166,6 +166,20 @@ fn wrong_use_exits_with_2() {
 }
 
 #[test]
+fn unpacked_directory_can_be_validated_from_the_cli() {
+    let dir = Scratch::new("validate");
+    let unpacked = dir.path("unpacked");
+    let unpack = run(&["unpack", CLASSIC, unpacked.to_str().unwrap()]);
+    assert!(unpack.status.success(), "{}", text(&unpack.stderr));
+
+    let validate = run(&["validate", unpacked.to_str().unwrap()]);
+    assert!(validate.status.success(), "{}", text(&validate.stderr));
+    assert!(
+        text(&validate.stdout).contains("0 modified, 0 missing, 0 added, 0 unsafe, 0 unverified")
+    );
+}
+
+#[test]
 fn a_fonts_folder_replaces_the_stand_ins() {
     let dir = Scratch::new("fonts");
     let fonts = dir.path("fonts");

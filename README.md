@@ -51,7 +51,7 @@ walkit render https://example.org/skin.wal -o preview.png
 
 ### Static archive inventory (provisional)
 
-`unpack` writes a provisional version 1 `manifest.json`, a provisional version 1
+`unpack` writes a provisional version 2 `manifest.json`, a provisional version 1
 `semantics.json`, and entry contents below `assets/`.
 The destination must be a new directory. It inspects archive paths and file extensions only;
 it does not run skin scripts or claim that every resource can be interpreted by another player.
@@ -62,12 +62,23 @@ and the original encoded path bytes are not preserved.
 ```
 walkit unpack skin.wsz unpacked-skin/
 walkit unpack skin.wal unpacked-skin/
+walkit validate unpacked-skin/
 ```
 
-The manifest's provisional fields are `format_version` (`1`), `archive_kind` (`wsz`, `wal`,
+`validate` compares extracted files with the manifest without changing the directory. It reports
+modified, missing, added, and unsafe paths. It exits 0 when every extracted file matches, 1 when
+the directory differs or a legacy entry cannot be fully checked, and 2 for an invalid directory
+or manifest. Version 1 manifests are still read, but have no per-file hashes: those entries can
+only be compared by size, so same-size edits are reported as unverified. Version 2 records a
+SHA-256 digest for each source file and detects same-size edits. The manifest is not signed, so
+these checks compare files with the manifest as it exists; they do not authenticate the manifest
+or prove that it is the original.
+
+The manifest's provisional fields are `format_version` (`2`), `archive_kind` (`wsz`, `wal`,
 `mixed`, or `unknown`), and `entries`. Each entry has the decoded `source_path`, nullable
 `output_path` relative to `assets/`, uncompressed `size`, extension-based `resource`
-classification, and an `extracted` flag. Resource labels are `image`, `audio`, `font`,
+classification, an `extracted` flag, and a lowercase `sha256` digest of its original bytes.
+Resource labels are `image`, `audio`, `font`,
 `text_or_archive`, and `opaque`. This is documentation for an experimental prototype, not a
 canonical public schema; incompatible changes require a `format_version` change if the
 prototype is retained.

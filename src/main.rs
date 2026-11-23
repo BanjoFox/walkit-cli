@@ -33,6 +33,8 @@ struct Cli {
 enum Command {
     /// Inventory a skin archive and extract its original file bytes into a directory.
     Unpack(Unpack),
+    /// Check an unpacked asset directory against its manifest.
+    Validate(Validate),
     /// Render one skin or many to PNG files.
     Render(Render),
     /// Print the default parameters, the Winamp Skin Museum's screenshot state, as a
@@ -56,6 +58,12 @@ struct Unpack {
     input: PathBuf,
     /// New directory to create; it must not already exist.
     output: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct Validate {
+    /// The directory written by `walkit unpack`.
+    directory: PathBuf,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -182,6 +190,39 @@ fn main() -> ExitCode {
                 Err(error) => Err(error),
             }
         }
+        Command::Validate(args) => match archive_export::validate_directory(&args.directory) {
+            Ok(report) => {
+                for path in &report.modified {
+                    println!("modified: {path}");
+                }
+                for path in &report.missing {
+                    println!("missing: {path}");
+                }
+                for path in &report.added {
+                    println!("added: {path}");
+                }
+                for path in &report.unsafe_paths {
+                    println!("unsafe: {path}");
+                }
+                if report.legacy_unverified > 0 {
+                    eprintln!(
+                        "warning: {} v1 entries matched by size only; same-size edits cannot be detected",
+                        report.legacy_unverified
+                    );
+                }
+                println!(
+                    "{} unchanged, {} modified, {} missing, {} added, {} unsafe, {} unverified",
+                    report.unchanged,
+                    report.modified.len(),
+                    report.missing.len(),
+                    report.added.len(),
+                    report.unsafe_paths.len(),
+                    report.legacy_unverified
+                );
+                Ok(report.is_clean())
+            }
+            Err(error) => Err(error),
+        },
         Command::Render(args) => render(args),
         Command::Params => {
             print!("{}", Params::default().to_json());
