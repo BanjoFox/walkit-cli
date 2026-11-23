@@ -464,11 +464,11 @@ fn inspect_xml_documents(files: &MemoryFiles, folder: &str) -> XmlInspection {
         .map(
             |(source_file, element_tag, element_id, attribute, target)| {
                 let matching_declaration_files = bitmap_declaration_files
-                    .get(&target.to_ascii_lowercase())
+                    .get(&target.to_lowercase())
                     .cloned()
                     .unwrap_or_default();
                 let matching_alias_declaration_files = alias_declaration_files
-                    .get(&target.to_ascii_lowercase())
+                    .get(&target.to_lowercase())
                     .cloned()
                     .unwrap_or_default();
                 BitmapReference {
@@ -540,7 +540,7 @@ impl XmlScan<'_> {
                 "bitmap" | "bitmapfont" | "color" | "container" | "elementalias" | "truetypefont"
             ) {
                 self.declarations
-                    .entry((node.name.clone(), id.to_ascii_lowercase()))
+                    .entry((node.name.clone(), id.to_lowercase()))
                     .or_default()
                     .push(source_file.to_string());
             }
@@ -728,6 +728,27 @@ mod tests {
         assert_eq!(modern.layouts[0].elements[0].children[0].tag, "button");
         assert_eq!(modern.bitmap_references[0].target, "asset");
         assert_eq!(modern.bitmap_references[0].source_file, "skin.xml");
+    }
+
+    #[test]
+    fn declaration_and_reference_ids_use_walkits_unicode_lowercase_convention() {
+        let entries = [(
+            "skin.xml",
+            Rc::from(r#"<WasabiXML><elements><bitmap id="Ä" file="first.bmp"/><bitmap id="ä" file="second.bmp"/></elements><container id="main"><layout id="normal"><button id="button" image="Ä"/></layout></container></WasabiXML>"#.as_bytes()),
+        )];
+        let semantics = inspect("wal", entries);
+        let modern = semantics.modern.unwrap();
+        let duplicate = modern
+            .duplicate_declarations
+            .iter()
+            .find(|declaration| declaration.tag == "bitmap")
+            .unwrap();
+        assert_eq!(duplicate.id, "ä");
+        assert_eq!(duplicate.source_files, ["skin.xml", "skin.xml"]);
+        assert_eq!(
+            modern.bitmap_references[0].matching_declaration_files,
+            ["skin.xml", "skin.xml"]
+        );
     }
 
     #[test]
