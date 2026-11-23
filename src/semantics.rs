@@ -550,11 +550,14 @@ impl XmlScan<'_> {
             "bitmap" | "bitmapfont" | "truetypefont" | "script"
         ) {
             if let Some(path) = node.get("file") {
-                let runtime_generated = node.name == "bitmap"
+                let runtime_generated = (node.name == "bitmap"
                     && path
                         .rsplit('/')
                         .next()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("$solid"));
+                        .is_some_and(|name| name.eq_ignore_ascii_case("$solid")))
+                    || ["@HAVE_LIBRARY@", "@HAVE_VIDEO@"]
+                        .iter()
+                        .any(|token| path.contains(token));
                 self.file_references.push(XmlFileReference {
                     source_file: source_file.to_string(),
                     tag: node.name.clone(),
@@ -760,7 +763,7 @@ mod tests {
             ),
             (
                 "parts/ui.xml",
-                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><bitmap id="escaped-generated" file="dir\$solid"/><bitmapfont id="fontgrid" file="fonts/grid.bmp"/><bitmapfont id="fontmissing" file="fonts/missing.bmp"/><bitmapfont id="fontliteral" file="$solid"/><script id="loader" file="scripts/loader.maki"/><include file="deep/panel.xml"/></elements>"#[..]),
+                Rc::from(&br#"<elements><elementalias id="LOGOALIAS" target="img/alternate.png"/><bitmap id="logo" file="img/alternate.png"/><bitmap id="missing" file="img/missing.png"/><bitmap id="generated" file="$solid" w="1" h="1"/><bitmap id="escaped-generated" file="dir\$solid"/><bitmap id="runtime-library" file="@HAVE_LIBRARY@.bmp"/><bitmapfont id="fontgrid" file="fonts/grid.bmp"/><bitmapfont id="fontmissing" file="fonts/missing.bmp"/><bitmapfont id="fontliteral" file="$solid"/><script id="loader" file="scripts/loader.maki"/><script id="runtime-video" file="@HAVE_VIDEO@.maki"/><script id="literal-token" file="@CUSTOM@.maki"/><include file="deep/panel.xml"/></elements>"#[..]),
             ),
             (
                 "parts/deep/panel.xml",
@@ -809,6 +812,9 @@ mod tests {
         assert_eq!(present("img/missing.png"), Some(false));
         assert_eq!(present("$solid"), None);
         assert_eq!(present("dir\\$solid"), Some(false));
+        assert_eq!(present("@HAVE_LIBRARY@.bmp"), None);
+        assert_eq!(present("@HAVE_VIDEO@.maki"), None);
+        assert_eq!(present("@CUSTOM@.maki"), Some(false));
         assert_eq!(present("fonts/grid.bmp"), Some(true));
         assert_eq!(present("fonts/missing.bmp"), Some(false));
         assert_eq!(

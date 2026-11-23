@@ -77,8 +77,9 @@ available sheets, playlist colors/font, visualizer colors, region names and poly
 and cursors. For modern skins it summarizes author metadata, declared containers and layouts,
 element attributes, and source XML documents. Each document records literal include paths and
 direct `<elements>` definitions; include references record whether their literal target exists
-at the skin root. Resource references record whether the literal archive path exists, and
-repeated IDs are reported as duplicate declarations. These are source declarations, not a
+at the skin root. Resource references record whether the literal archive path exists where that
+check is meaningful; generated and known runtime-substituted paths remain unknown. Repeated IDs
+are reported as duplicate declarations. These are source declarations, not a
 resolved include graph: a missing root entry may still resolve relative to its including file,
 and the summary does not identify loaded documents, reachable
 definitions, or active layouts. Recognized bitmap attributes in the source are reported with
