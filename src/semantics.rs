@@ -197,7 +197,13 @@ pub fn inspect<'a>(
     }
     let folders = crate::skin::skin_folders(&names);
     let skin_folder = folders.first().cloned();
-    let files = files.in_folder(skin_folder.as_deref().unwrap_or_default());
+    let normalized_folder = match skin_folder.as_deref() {
+        Some(folder) if !folder.is_empty() => {
+            format!("{}/", walkit::files::normalize(folder))
+        }
+        _ => String::new(),
+    };
+    let files = files.in_folder(&normalized_folder);
 
     let mut diagnostics = Vec::new();
     let (classic, modern) = match archive_kind {
@@ -739,6 +745,45 @@ mod tests {
             modern.layouts[0].elements[0].children[0].attributes[0].value,
             "main.bmp"
         );
+    }
+
+    #[test]
+    fn semantics_select_mixed_case_nested_skin_folders() {
+        let entries = [
+            (
+                "Glasses/Skin.xml",
+                Rc::from(&br#"<WasabiXML version="0.8"><skininfo><name>Glasses</name></skininfo><container id="main"><layout id="normal"><button id="logoButton" image="logo"/></layout></container></WasabiXML>"#[..]),
+            ),
+            (
+                "Glasses/XML/Part.XML",
+                Rc::from(&br#"<elements><bitmap id="logo" file="img/Logo.png"/></elements>"#[..]),
+            ),
+            ("Glasses/img/Logo.png", Rc::from(&b"opaque image bytes"[..])),
+        ];
+
+        let semantics = inspect("wal", entries);
+        assert_eq!(semantics.skin_folder.as_deref(), Some("Glasses/"));
+        let modern = semantics.modern.unwrap();
+        assert_eq!(modern.skin_info.name.as_deref(), Some("Glasses"));
+        assert_eq!(modern.format_version.as_deref(), Some("0.8"));
+        assert_eq!(modern.xml_documents.len(), 2);
+        assert!(modern
+            .xml_documents
+            .iter()
+            .any(|document| document.source_file == "Glasses/skin.xml"));
+        assert_eq!(modern.layouts.len(), 1);
+        assert_eq!(modern.bitmap_references[0].target, "logo");
+
+        let classic_entries = [
+            ("ClassicSkin/Main.BMP", Rc::from(&b"bitmap bytes"[..])),
+            (
+                "ClassicSkin/Pledit.TXT",
+                Rc::from(&b"[Text]\nNormal=#123456\nFont=Arial\n"[..]),
+            ),
+        ];
+        let classic = inspect("wsz", classic_entries);
+        assert_eq!(classic.skin_folder.as_deref(), Some("ClassicSkin/"));
+        assert_eq!(classic.classic.unwrap().playlist.unwrap().normal, "#123456");
     }
 
     #[test]
