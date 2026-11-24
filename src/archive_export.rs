@@ -1382,7 +1382,7 @@ mod tests {
 
         fs::write(&output, b"keep existing destination").unwrap();
         assert!(repack_directory(&directory, &output).is_err());
-        assert_eq!(fs::read(output).unwrap(), b"keep existing destination");
+        assert_eq!(fs::read(&output).unwrap(), b"keep existing destination");
         assert_eq!(
             fs::read_dir(&base)
                 .unwrap()
@@ -1392,6 +1392,20 @@ mod tests {
             2,
             "failed no-overwrite installation leaves no temporary archive"
         );
+        #[cfg(unix)]
+        {
+            fs::remove_file(&output).unwrap();
+            let target = base.join("protected-target");
+            fs::write(&target, b"keep symlink target").unwrap();
+            std::os::unix::fs::symlink(&target, &output).unwrap();
+            assert!(repack_directory(&directory, &output).is_err());
+            assert!(fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&target).unwrap(), b"keep symlink target");
+            fs::remove_file(&output).unwrap();
+        }
         assert!(repack_directory(&directory, &directory.join("inside.wsz"))
             .unwrap_err()
             .contains("outside the unpacked directory"));
