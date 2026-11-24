@@ -327,15 +327,7 @@ fn manifest_json(manifest: &Manifest) -> Result<Vec<u8>, String> {
     Ok(writer.bytes)
 }
 
-/// Compare an unpacked directory with its manifest without modifying the directory.
-/// Version 1 manifests can only detect size changes; version 2 also checks SHA-256.
-pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> {
-    let root_metadata =
-        fs::symlink_metadata(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(format!("not a regular directory: {}", directory.display()));
-    }
-
+fn read_manifest_snapshot(directory: &Path, operation: &str) -> Result<ManifestSnapshot, String> {
     let manifest_path = directory.join("manifest.json");
     let manifest_metadata = fs::symlink_metadata(&manifest_path)
         .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
@@ -346,7 +338,7 @@ pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> 
         ));
     }
     if manifest_metadata.len() > MAX_MANIFEST_BYTES {
-        return Err("manifest.json is too large to validate".into());
+        return Err(format!("manifest.json is too large to {operation}"));
     }
     let mut manifest_bytes = Vec::new();
     open_validation_file(&manifest_path)
@@ -355,10 +347,22 @@ pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> 
         .read_to_end(&mut manifest_bytes)
         .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
     if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err("manifest.json is too large to validate".into());
+        return Err(format!("manifest.json is too large to {operation}"));
     }
-    let manifest: ManifestSnapshot = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("{}: invalid manifest: {e}", manifest_path.display()))?;
+    serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("{}: invalid manifest: {e}", manifest_path.display()))
+}
+
+/// Compare an unpacked directory with its manifest without modifying the directory.
+/// Version 1 manifests can only detect size changes; version 2 also checks SHA-256.
+pub fn validate_directory(directory: &Path) -> Result<ValidationReport, String> {
+    let root_metadata =
+        fs::symlink_metadata(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!("not a regular directory: {}", directory.display()));
+    }
+
+    let manifest = read_manifest_snapshot(directory, "validate")?;
     let expected = validate_manifest(&manifest)?;
 
     let assets = directory.join("assets");
@@ -484,29 +488,7 @@ pub fn repack_directory(directory: &Path, destination: &Path) -> Result<RepackRe
         ));
     }
 
-    let manifest_path = directory.join("manifest.json");
-    let manifest_metadata = fs::symlink_metadata(&manifest_path)
-        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
-        return Err(format!(
-            "manifest is not a regular file: {}",
-            manifest_path.display()
-        ));
-    }
-    if manifest_metadata.len() > MAX_MANIFEST_BYTES {
-        return Err("manifest.json is too large to repack".into());
-    }
-    let mut manifest_bytes = Vec::new();
-    open_validation_file(&manifest_path)
-        .map_err(|e| format!("{}: {e}", manifest_path.display()))?
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut manifest_bytes)
-        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err("manifest.json is too large to repack".into());
-    }
-    let manifest: ManifestSnapshot = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("{}: invalid manifest: {e}", manifest_path.display()))?;
+    let manifest = read_manifest_snapshot(directory, "repack")?;
     validate_manifest(&manifest)?;
     let archive_kind = match manifest.archive_kind.as_str() {
         "wsz" => "wsz",
