@@ -59,6 +59,10 @@ Unknown resources are marked `opaque` and retained. Unsafe paths and symbolic li
 listed without extraction. Entry contents are copied unchanged; ZIP compression, metadata,
 and the original encoded path bytes are not preserved.
 
+Use a trusted, quiescent parent for the new destination and keep the destination tree
+quiescent during extraction. Extraction uses path-based filesystem operations; it does not
+defend against a concurrent process replacing destination directories and redirecting writes.
+
 ```
 walkit unpack skin.wsz unpacked-skin/
 walkit unpack skin.wal unpacked-skin/
