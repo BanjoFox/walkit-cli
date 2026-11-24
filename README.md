@@ -125,15 +125,18 @@ same-size edits cannot be distinguished from the recorded source. Output names m
 extension matching the manifest's `archive_kind` (`.wsz` or `.wal`), and an existing destination
 is never overwritten.
 
-Entries are written in sorted path order with newly generated ZIP metadata. Original entry order,
-timestamps, compression settings, comments, and encoded path bytes are not retained. The command
-finalizes and reads back the ZIP, checks its skin kind and entries, and verifies each entry's
-bytes before installing it. Installation uses a temporary sibling and a no-overwrite hard link;
-filesystems that do not support hard links will fail safely. Repacking bounds each file to 32 MiB,
-total uncompressed contents to 256 MiB, and the output archive to 256 MiB. As with `validate`,
-use a quiescent unpacked directory: path-based traversal does not prevent a concurrent parent
-directory replacement. Structural verification does not prove rendering compatibility or runtime
-equivalence, and imported scripts are never executed.
+Entries are written in sorted path order; empty directory records are omitted. Original entry
+order, timestamps, file attributes and creator-platform fields, compression settings, comments,
+and encoded path bytes are not retained. The command finalizes and reads back the ZIP, checks its
+skin kind and entries, and verifies each entry's bytes before installing it. Installation uses a
+temporary sibling and a no-overwrite hard link; filesystems that do not support hard links will
+fail safely. Repacking bounds each file to 32 MiB, total uncompressed contents to 256 MiB, and the
+output archive to 256 MiB. As with `validate`, use a quiescent unpacked directory: path-based
+traversal does not prevent a concurrent parent-directory replacement. Structural verification
+does not prove rendering compatibility or runtime equivalence, and imported scripts are never
+executed. Keep the output parent under your control and quiescent as well; verification and
+installation refer to the temporary sibling by path and do not defend against another process
+replacing entries in that parent during repacking.
 
 ### Many skins
 

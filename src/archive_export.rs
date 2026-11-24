@@ -1242,15 +1242,112 @@ mod tests {
     }
 
     #[test]
-    fn repack_rejects_added_missing_unsafe_and_existing_destinations() {
-        let directory = scratch("repack-reject");
+    fn repacks_preserve_fixture_paths_and_bytes_but_normalize_zip_metadata() {
+        for (name, fixture, expected_kind) in [
+            (
+                "classic",
+                include_bytes!("../tests/skins/walkit-classic.wsz").as_slice(),
+                crate::skin::Kind::Classic,
+            ),
+            (
+                "modern",
+                include_bytes!("../tests/skins/walkit-modern.wal").as_slice(),
+                crate::skin::Kind::Modern,
+            ),
+        ] {
+            let directory = scratch(&format!("repack-fidelity-{name}"));
+            let _ = fs::remove_dir_all(&directory);
+            let original_manifest = inventory(fixture).unwrap();
+            extract(fixture, &directory).unwrap();
+            let output =
+                directory.with_extension(format!("roundtrip.{}", original_manifest.archive_kind));
+            repack_directory(&directory, &output).unwrap();
+            let output_bytes = read_archive(&output).unwrap();
+            let repacked_manifest = inventory(&output_bytes).unwrap();
+
+            let hashes = |manifest: &Manifest| {
+                manifest
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.source_path.clone(), entry.sha256.clone()))
+                    .collect::<HashMap<_, _>>()
+            };
+            assert_eq!(hashes(&original_manifest), hashes(&repacked_manifest));
+            assert_eq!(
+                original_manifest.entries.len(),
+                repacked_manifest.entries.len()
+            );
+            let output_paths: Vec<_> = repacked_manifest
+                .entries
+                .iter()
+                .map(|entry| entry.source_path.as_str())
+                .collect();
+            assert!(output_paths.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                crate::skin::Skin::open(&output_bytes, None, None)
+                    .unwrap()
+                    .kind,
+                expected_kind
+            );
+
+            let mut original_zip = zip::ZipArchive::new(Cursor::new(fixture)).unwrap();
+            let mut rebuilt_zip = zip::ZipArchive::new(Cursor::new(&output_bytes)).unwrap();
+            assert_eq!(original_zip.len(), rebuilt_zip.len());
+            for index in 0..original_zip.len() {
+                let original = original_zip.by_index(index).unwrap();
+                let rebuilt = rebuilt_zip.by_index(index).unwrap();
+                assert_eq!(original.name(), rebuilt.name());
+                assert_ne!(original.last_modified(), rebuilt.last_modified());
+            }
+
+            let _ = fs::remove_file(output);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn repack_sorts_unsorted_source_entries_deterministically() {
+        let source = archive(&[
+            ("z-last.bin", b"last"),
+            ("main.bmp", b"classic marker"),
+            ("a-first.bin", b"first"),
+        ]);
+        let directory = scratch("repack-order");
         let _ = fs::remove_dir_all(&directory);
+        extract(&source, &directory).unwrap();
+        let first = directory.with_extension("first.wsz");
+        let second = directory.with_extension("second.wsz");
+        repack_directory(&directory, &first).unwrap();
+        repack_directory(&directory, &second).unwrap();
+
+        let mut original = zip::ZipArchive::new(Cursor::new(source)).unwrap();
+        assert_eq!(original.by_index(0).unwrap().name(), "z-last.bin");
+        let first_bytes = fs::read(&first).unwrap();
+        let second_bytes = fs::read(&second).unwrap();
+        assert_eq!(first_bytes, second_bytes);
+        let mut repacked = zip::ZipArchive::new(Cursor::new(first_bytes)).unwrap();
+        let names: Vec<_> = (0..repacked.len())
+            .map(|index| repacked.by_index(index).unwrap().name().to_owned())
+            .collect();
+        assert_eq!(names, ["a-first.bin", "main.bmp", "z-last.bin"]);
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn repack_rejects_added_missing_unsafe_and_existing_destinations() {
+        let base = scratch("repack-reject");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).unwrap();
+        let directory = base.join("unpacked");
         extract(
             include_bytes!("../tests/skins/walkit-classic.wsz"),
             &directory,
         )
         .unwrap();
-        let output = directory.with_extension("wsz");
+        let output = base.join("new.wsz");
 
         fs::write(directory.join("assets/added.txt"), b"added").unwrap();
         assert!(repack_directory(&directory, &output)
@@ -1286,10 +1383,19 @@ mod tests {
         fs::write(&output, b"keep existing destination").unwrap();
         assert!(repack_directory(&directory, &output).is_err());
         assert_eq!(fs::read(output).unwrap(), b"keep existing destination");
+        assert_eq!(
+            fs::read_dir(&base)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<HashSet<_>>()
+                .len(),
+            2,
+            "failed no-overwrite installation leaves no temporary archive"
+        );
         assert!(repack_directory(&directory, &directory.join("inside.wsz"))
             .unwrap_err()
             .contains("outside the unpacked directory"));
-        let _ = fs::remove_dir_all(directory);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
