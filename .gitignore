@@ -1,6 +1,7 @@
 /target
 /out
 .scannerwork/
+/local-test-skins/
 *.wsz
 *.wal
 !tests/skins/*.wsz
